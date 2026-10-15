@@ -1,0 +1,192 @@
+# OTel Collector AGENT (DaemonSet, one per node): collect on the node, ship OTLP to Kafka.
+# Loaded together with collector/generated/{gpu,engine}-transform.yaml (generated from normalize/*.yaml):
+#   otelcol-contrib --config=agent.yaml --config=gpu-transform.yaml --config=engine-transform.yaml
+#
+# Scrape targets are opted in with a pod annotation:
+#   observe-d.io/scrape: gpu      GPU exporter (DCGM / AMD metrics exporter / fake exporter)
+#   observe-d.io/scrape: engine   inference engine /metrics (vLLM)
+# Prometheus scrapes the same targets at full fidelity; this agent only ships the ClickHouse subset.
+
+extensions:
+  health_check: {endpoint: 0.0.0.0:13133}
+  file_storage:
+    directory: /var/lib/otelcol/queue
+    create_directory: true
+
+receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: 0.0.0.0:4317}
+      http: {endpoint: 0.0.0.0:4318}
+
+  # Pod logs, filtered at the edge to the lines observe-d acts on (GPU fatal events, collective-library
+  # errors, OOMs) so general application logging is not shipped. Kernel messages on real nodes: add a
+  # journald receiver (needs journalctl in the collector image) with the same filter — see docs/runbook.md.
+  filelog/pods:
+    include: [/var/log/pods/*/*/*.log]
+    exclude: [/var/log/pods/observe-d_otel-*/*/*.log]
+    start_at: end
+    include_file_path: true
+    operators:
+      - type: container
+      - type: filter
+        expr: >-
+          not (body matches "(?i)(NVRM: Xid|amdgpu.*(RAS|GPU reset)|NCCL WARN|RCCL WARN|NCCL error|RCCL error|CUDA error|HIP error|CUDA out of memory|HIP out of memory)")
+      - type: add
+        field: attributes["log.source"]
+        value: node_filelog
+
+  prometheus/gpu:
+    config:
+      scrape_configs:
+        - job_name: gpu
+          scrape_interval: 10s
+          honor_labels: true   # the exporter's own pod/namespace labels name the GPU's consumer pod
+          kubernetes_sd_configs: [{role: pod}]
+          relabel_configs:
+            # opt-in by annotation, or the standard exporter labels (NVIDIA GPU Operator dcgm-exporter,
+            # AMD GPU Operator metrics exporter) so real exporters need no changes
+            - source_labels: [__meta_kubernetes_pod_annotation_observe_d_io_scrape]
+              regex: gpu
+              target_label: __tmp_gpu
+              replacement: "1"
+            - source_labels: [__meta_kubernetes_pod_label_app, __meta_kubernetes_pod_label_app_kubernetes_io_name]
+              separator: ";"
+              regex: "(.*;)?(nvidia-dcgm-exporter|dcgm-exporter|metrics-exporter|amd-metrics-exporter|device-metrics-exporter)(;.*)?"
+              target_label: __tmp_gpu
+              replacement: "1"
+            - source_labels: [__tmp_gpu]
+              regex: "1"
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_node_name]
+              regex: "${env:NODE_NAME}"
+              action: keep
+            # annotated port wins; otherwise keep only container ports named like a metrics port
+            - source_labels: [__meta_kubernetes_pod_annotation_observe_d_io_port]
+              regex: (\d+)
+              target_label: __tmp_port
+            - source_labels: [__meta_kubernetes_pod_container_port_name]
+              regex: ".*metrics.*"
+              target_label: __tmp_named
+              replacement: "1"
+            - source_labels: [__tmp_port]
+              regex: (\d+)
+              target_label: __tmp_named
+              replacement: "1"
+            - source_labels: [__tmp_named]
+              regex: "1"
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_ip, __tmp_port]
+              separator: ":"
+              regex: "(.+:\\d+)"
+              target_label: __address__
+
+  prometheus/engine:
+    config:
+      scrape_configs:
+        - job_name: engine
+          scrape_interval: 10s
+          kubernetes_sd_configs: [{role: pod}]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_observe_d_io_scrape]
+              regex: engine
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_node_name]
+              regex: "${env:NODE_NAME}"
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_annotation_observe_d_io_port]
+              regex: (\d+)
+              target_label: __tmp_port
+            - source_labels: [__meta_kubernetes_pod_ip, __tmp_port]
+              separator: ":"
+              regex: "(.+:\\d+)"
+              target_label: __address__
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_role]
+              regex: "(.+)"
+              target_label: role
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  k8s_attributes:
+    auth_type: serviceAccount
+    passthrough: false
+    pod_association:
+      - sources: [{from: resource_attribute, name: k8s.pod.name}, {from: resource_attribute, name: k8s.namespace.name}]
+      - sources: [{from: connection}]
+    extract:
+      metadata: [k8s.pod.name, k8s.pod.uid, k8s.namespace.name, k8s.node.name, k8s.deployment.name]
+      labels:   # llm-d P/D role of the engine pod (prefill | decode); absent on aggregated pods
+        - {tag_name: llm_d.role, key: llm-d.ai/role, from: pod}
+  resource/cluster:
+    attributes:
+      - {key: k8s.cluster.name, value: "${env:CLUSTER_NAME}", action: upsert}
+  # Cardinality guard: request-scoped IDs never become metric labels (docs/header-contract.md).
+  transform/cardinality:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "request_id")
+          - delete_key(attributes, "trace_id")
+          - delete_key(attributes, "user_id")
+          - delete_key(attributes, "session_id")
+  batch:
+    send_batch_size: 8192
+    timeout: 2s
+
+exporters:
+  kafka:
+    brokers: ["${env:KAFKA_BROKERS}"]
+    logs: {topic: otlp_logs, encoding: otlp_proto}
+    metrics: {topic: otlp_metrics, encoding: otlp_proto}
+    traces: {topic: otlp_traces, encoding: otlp_proto}
+    producer:
+      compression: zstd
+      max_message_bytes: 4000000
+    sending_queue:
+      enabled: true
+      storage: file_storage
+    retry_on_failure: {enabled: true, max_elapsed_time: 0s}
+
+service:
+  extensions: [health_check, file_storage]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus: {host: 0.0.0.0, port: 8888}
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8s_attributes, resource/cluster, batch]
+      exporters: [kafka]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, k8s_attributes, resource/cluster, batch]
+      exporters: [kafka]
+    logs/files:
+      receivers: [filelog/pods]
+      processors: [memory_limiter, k8s_attributes, resource/cluster, batch]
+      exporters: [kafka]
+    metrics/gpu:
+      receivers: [prometheus/gpu]
+      processors: [memory_limiter, metrics_transform/gpu_normalize, filter/gpu_subset, resource/cluster, batch]
+      exporters: [kafka]
+    metrics/engine:
+      receivers: [prometheus/engine]
+      processors:
+        - memory_limiter
+        - metrics_transform/llm_normalize
+        - filter/llm_subset
+        - transform/cardinality
+        - resource/cluster
+        - batch
+      exporters: [kafka]

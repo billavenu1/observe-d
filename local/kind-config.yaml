@@ -1,0 +1,15 @@
+# Local "GPU cluster" for prototyping (slim profile: single node acts as control plane + GPU node).
+# Create with:  KIND_EXPERIMENTAL_PROVIDER=podman kind create cluster --config local/kind-config.yaml
+# The fake GPU capacity (nvidia.com/gpu or amd.com/gpu: 8) is patched onto the node by tools/dev.py.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: observe-d
+nodes:
+  - role: control-plane
+    labels:
+      observe-d/gpu-node: "true"
+    extraPortMappings:
+      - containerPort: 30300   # Grafana (NodePort)
+        hostPort: 3300
+      - containerPort: 30090   # Prometheus (NodePort)
+        hostPort: 9090

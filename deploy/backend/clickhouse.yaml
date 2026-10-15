@@ -1,0 +1,62 @@
+# ClickHouse via the Altinity clickhouse-operator — single node sized for 5k req/s (MVP.md §2.1:
+# 32 vCPU, 128 GB RAM, 4 TB NVMe). Prereq: operator installed; Secret `clickhouse-otel` with key `password`.
+# Production scale-out (PLAN.md §10.1): add Keeper, replicasCount: 2+, ReplicatedMergeTree migrations.
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: observe-d
+  namespace: observability
+spec:
+  defaults:
+    templates:
+      podTemplate: clickhouse
+      dataVolumeClaimTemplate: data
+      serviceTemplate: clickhouse
+  configuration:
+    clusters:
+      - name: observe-d
+        layout: {shardsCount: 1, replicasCount: 1}
+    users:
+      otel/k8s_secret_password: observability/clickhouse-otel/password
+      otel/networks/ip: ["0.0.0.0/0"]
+      otel/profile: default
+      otel/access_management: 1
+    profiles:
+      default/async_insert: 1
+      default/wait_for_async_insert: 1
+      default/max_memory_usage: 40000000000
+    settings:
+      max_server_memory_usage_to_ram_ratio: 0.8
+      mark_cache_size: 10737418240
+      logger/level: warning
+    files:
+      config.d/observe-d.xml: |
+        <clickhouse>
+            <trace_log remove="1"/>
+            <text_log remove="1"/>
+        </clickhouse>
+  templates:
+    podTemplates:
+      - name: clickhouse
+        spec:
+          nodeSelector: {observe-d/role: observability}
+          containers:
+            - name: clickhouse
+              image: clickhouse/clickhouse-server:26.3
+              resources:
+                requests: {cpu: "16", memory: 96Gi}
+                limits: {cpu: "32", memory: 120Gi}
+    volumeClaimTemplates:
+      - name: data
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: local-nvme   # set to the cluster's NVMe-backed class
+          resources: {requests: {storage: 4Ti}}
+    serviceTemplates:
+      - name: clickhouse
+        generateName: clickhouse-observe-d
+        spec:
+          type: ClusterIP
+          ports:
+            - {name: http, port: 8123}
+            - {name: native, port: 9000}

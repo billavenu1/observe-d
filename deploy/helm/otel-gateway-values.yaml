@@ -1,0 +1,42 @@
+# OTel Collector GATEWAY (Kafka -> ClickHouse) on the real cluster, via the official chart:
+#   helm upgrade --install otel-gateway open-telemetry/opentelemetry-collector -n observability \
+#     -f deploy/helm/otel-gateway-values.yaml
+# The collector config is the same collector/gateway.yaml used locally, shipped as the ConfigMap
+# `otel-gateway-config` by `python -m tools.render` (no inline copy here, so it cannot drift).
+mode: deployment
+image:
+  repository: otel/opentelemetry-collector-contrib
+  tag: "0.156.0"
+command:
+  name: otelcol-contrib
+  extraArgs: ["--config=/conf/gateway.yaml"]
+configMap:
+  create: false
+  existingName: otel-gateway-config
+extraVolumes:
+  - name: gateway-config
+    configMap: {name: otel-gateway-config}
+extraVolumeMounts:
+  - {name: gateway-config, mountPath: /conf}
+replicaCount: 4
+autoscaling:
+  enabled: true
+  minReplicas: 4
+  maxReplicas: 8                      # <= Kafka partitions (24)
+  targetCPUUtilizationPercentage: 70
+resources:
+  requests: {cpu: "1", memory: 2Gi}
+  limits: {cpu: "2", memory: 4Gi}
+nodeSelector: {observe-d/role: observability}
+extraEnvs:
+  - {name: KAFKA_BROKERS, value: "observe-d-kafka-bootstrap.observability.svc:9092"}
+  - {name: CLICKHOUSE_ENDPOINT, value: "tcp://clickhouse-observe-d.observability.svc:9000?dial_timeout=10s"}
+  - {name: CLICKHOUSE_USER, value: otel}
+  - name: CLICKHOUSE_PASSWORD
+    valueFrom: {secretKeyRef: {name: clickhouse-otel, key: password}}
+ports:
+  metrics: {enabled: true, containerPort: 8888, servicePort: 8888, protocol: TCP}
+serviceMonitor:
+  enabled: true
+podMonitor:
+  enabled: false

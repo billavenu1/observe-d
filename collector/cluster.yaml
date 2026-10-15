@@ -1,0 +1,40 @@
+# OTel Collector CLUSTER (Deployment, exactly 1 replica): cluster-scoped sources that must not be collected
+# once per node. Ships to the same Kafka topics as the agents.
+
+extensions:
+  health_check: {endpoint: 0.0.0.0:13133}
+
+receivers:
+  k8sobjects:
+    auth_type: serviceAccount
+    objects:
+      - name: events
+        mode: watch
+        group: events.k8s.io
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  resource/cluster:
+    attributes:
+      - {key: k8s.cluster.name, value: "${env:CLUSTER_NAME}", action: upsert}
+      - {key: service.name, value: k8s-events, action: upsert}
+  batch:
+    timeout: 2s
+
+exporters:
+  kafka:
+    brokers: ["${env:KAFKA_BROKERS}"]
+    logs: {topic: otlp_logs, encoding: otlp_proto}
+    producer: {compression: zstd}
+    retry_on_failure: {enabled: true, max_elapsed_time: 0s}
+
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [k8sobjects]
+      processors: [memory_limiter, resource/cluster, batch]
+      exporters: [kafka]

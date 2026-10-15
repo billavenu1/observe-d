@@ -1,0 +1,114 @@
+# Agent (DaemonSet) + cluster (Deployment) OTel collectors. Config comes from the ConfigMaps
+# otel-agent-config / otel-cluster-config, created by tools/dev.py from collector/*.yaml.
+# The backend (Kafka) runs outside kind on the `kind` podman network: reached via hostAliases.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observe-d
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: otel-collector, namespace: observe-d}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: observe-d-otel-collector}
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces, nodes, events]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [replicasets, deployments]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: observe-d-otel-collector}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: observe-d-otel-collector}
+subjects: [{kind: ServiceAccount, name: otel-collector, namespace: observe-d}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: otel-agent, namespace: observe-d}
+spec:
+  selector: {app.kubernetes.io/name: otel-agent}
+  internalTrafficPolicy: Local   # pods talk to the agent on their own node
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+    - {name: otlp-http, port: 4318, targetPort: 4318}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: otel-agent, namespace: observe-d}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: otel-agent}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: otel-agent}
+    spec:
+      serviceAccountName: otel-collector
+      hostAliases:
+        - {ip: "__KAFKA_IP__", hostnames: [kafka]}
+      containers:
+        - name: otelcol
+          image: docker.io/otel/opentelemetry-collector-contrib:__OTELCOL_TAG__
+          args:
+            - --config=/conf/agent.yaml
+            - --config=/conf/gpu-transform.yaml
+            - --config=/conf/engine-transform.yaml
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - {name: CLUSTER_NAME, value: __CLUSTER_NAME__}
+            - {name: KAFKA_BROKERS, value: "kafka:9092"}
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: otlp-http, containerPort: 4318}
+            - {name: metrics, containerPort: 8888}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 384Mi}
+          readinessProbe: {httpGet: {path: /, port: 13133}}
+          volumeMounts:
+            - {name: conf, mountPath: /conf}
+            - {name: queue, mountPath: /var/lib/otelcol}
+            - {name: podlogs, mountPath: /var/log/pods, readOnly: true}
+      volumes:
+        - name: podlogs
+          hostPath: {path: /var/log/pods}
+        - name: conf
+          configMap: {name: otel-agent-config}
+        - name: queue
+          hostPath: {path: /var/lib/otelcol, type: DirectoryOrCreate}
+      securityContext: {runAsUser: 0}   # hostPath queue directory
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: otel-cluster, namespace: observe-d}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: otel-cluster}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: otel-cluster}
+    spec:
+      serviceAccountName: otel-collector
+      hostAliases:
+        - {ip: "__KAFKA_IP__", hostnames: [kafka]}
+      containers:
+        - name: otelcol
+          image: docker.io/otel/opentelemetry-collector-contrib:__OTELCOL_TAG__
+          args: [--config=/conf/cluster.yaml]
+          env:
+            - {name: CLUSTER_NAME, value: __CLUSTER_NAME__}
+            - {name: KAFKA_BROKERS, value: "kafka:9092"}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts: [{name: conf, mountPath: /conf}]
+      volumes:
+        - name: conf
+          configMap: {name: otel-cluster-config}
