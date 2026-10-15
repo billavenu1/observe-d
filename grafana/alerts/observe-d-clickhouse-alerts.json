@@ -1,0 +1,293 @@
+{
+  "apiVersion": 1,
+  "groups": [
+    {
+      "orgId": 1,
+      "name": "observe-d-clickhouse",
+      "folder": "observe-d",
+      "interval": "1m",
+      "rules": [
+        {
+          "uid": "od-gpu-fatal-logs",
+          "title": "GPUFatalEventFromLogs",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "clickhouse",
+              "model": {
+                "datasource": {
+                  "type": "grafana-clickhouse-datasource",
+                  "uid": "clickhouse"
+                },
+                "editorType": "sql",
+                "queryType": "table",
+                "format": 1,
+                "rawSql": "SELECT count() AS value FROM gpu_fatal_events WHERE critical = 1 AND ts > now() - INTERVAL 5 MINUTE",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "critical",
+            "layer": "gpu",
+            "observe_d": "true"
+          },
+          "annotations": {
+            "summary": "Critical GPU event in kernel logs (NVIDIA Xid / AMD RAS uncorrectable or GPU reset): drain the node. Details: SELECT * FROM gpu_fatal_events ORDER BY ts DESC"
+          }
+        },
+        {
+          "uid": "od-collective-errors",
+          "title": "CollectiveLibraryErrors",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "clickhouse",
+              "model": {
+                "datasource": {
+                  "type": "grafana-clickhouse-datasource",
+                  "uid": "clickhouse"
+                },
+                "editorType": "sql",
+                "queryType": "table",
+                "format": 1,
+                "rawSql": "SELECT count() AS value FROM collective_errors WHERE ts > now() - INTERVAL 5 MINUTE",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "warning",
+            "layer": "network",
+            "observe_d": "true"
+          },
+          "annotations": {
+            "summary": "NCCL/RCCL errors in engine logs: tensor-parallel collectives failing (network dashboard)."
+          }
+        },
+        {
+          "uid": "od-trace-join",
+          "title": "TracePropagationBroken",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "clickhouse",
+              "model": {
+                "datasource": {
+                  "type": "grafana-clickhouse-datasource",
+                  "uid": "clickhouse"
+                },
+                "editorType": "sql",
+                "queryType": "table",
+                "format": 1,
+                "rawSql": "SELECT sum(missing_engine_span) / greatest(sum(routed), 1) AS value FROM join_health WHERE minute > now() - INTERVAL 15 MINUTE",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0.01
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "10m",
+          "labels": {
+            "severity": "warning",
+            "layer": "traceability",
+            "observe_d": "true"
+          },
+          "annotations": {
+            "summary": "More than 1% of routed requests have no engine span: traceparent not reaching vLLM, or tracing off."
+          }
+        },
+        {
+          "uid": "od-goodput",
+          "title": "GoodputBelowTarget",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "clickhouse",
+              "model": {
+                "datasource": {
+                  "type": "grafana-clickhouse-datasource",
+                  "uid": "clickhouse"
+                },
+                "editorType": "sql",
+                "queryType": "table",
+                "format": 1,
+                "rawSql": "SELECT if(sum(requests) < 50, 1, sum(slo_good) / sum(requests)) AS value FROM llm_rollup_1m FINAL WHERE minute > now() - INTERVAL 15 MINUTE",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "lt",
+                      "params": [
+                        0.95
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "15m",
+          "labels": {
+            "severity": "warning",
+            "layer": "vllm",
+            "observe_d": "true"
+          },
+          "annotations": {
+            "summary": "Less than 95% of requests met their TTFT/TPOT SLO in the last 15 minutes."
+          }
+        },
+        {
+          "uid": "od-cost-spike",
+          "title": "OrgCostSpike",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 900,
+                "to": 0
+              },
+              "datasourceUid": "clickhouse",
+              "model": {
+                "datasource": {
+                  "type": "grafana-clickhouse-datasource",
+                  "uid": "clickhouse"
+                },
+                "editorType": "sql",
+                "queryType": "table",
+                "format": 1,
+                "rawSql": "SELECT max(if(hours >= 24 AND avg_h > 0, last_h / avg_h, 0)) AS value FROM ( SELECT org_id, sumIf(cost_infra_usd, hour = toStartOfHour(now() - INTERVAL 1 HOUR)) AS last_h, sumIf(cost_infra_usd, hour >= now() - INTERVAL 7 DAY) / greatest(uniqExactIf(hour, hour >= now() - INTERVAL 7 DAY), 1) AS avg_h, uniqExactIf(hour, hour >= now() - INTERVAL 7 DAY) AS hours FROM tokenomics_hourly FINAL WHERE org_id NOT IN ('(idle)', '(unallocated)') GROUP BY org_id)",
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        3
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "warning",
+            "layer": "tokenomics",
+            "observe_d": "true"
+          },
+          "annotations": {
+            "summary": "An org's infra cost last hour is more than 3x its 7-day hourly average."
+          }
+        }
+      ]
+    }
+  ]
+}

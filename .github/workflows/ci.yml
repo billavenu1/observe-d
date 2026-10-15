@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy normalize sim tools grafana
+      - name: generated files are up to date
+        run: uv run python -m normalize.generate --check
+      - run: uv run pytest -m "not sql and not e2e"
+
+  sql:
+    runs-on: ubuntu-latest
+    needs: lint-unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      # exit code 5 = no tests collected (allowed until the M1 migrations land)
+      - run: uv run pytest -m sql || [ $? -eq 5 ]

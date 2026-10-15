@@ -1,0 +1,401 @@
+{
+  "uid": "od-requests",
+  "title": "observe-d / 07 Request explorer",
+  "description": "Every request (llm_requests). Paste a trace_id / request_id for the drill-down.",
+  "tags": [
+    "observe-d",
+    "traceability"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "org",
+        "label": "Org",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "clickhouse"
+        },
+        "query": "SELECT DISTINCT org_id FROM llm_requests WHERE ts > now() - INTERVAL 1 DAY",
+        "definition": "SELECT DISTINCT org_id FROM llm_requests WHERE ts > now() - INTERVAL 1 DAY",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": "",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "clickhouse"
+        },
+        "query": "SELECT DISTINCT model FROM llm_requests WHERE ts > now() - INTERVAL 1 DAY AND model != ''",
+        "definition": "SELECT DISTINCT model FROM llm_requests WHERE ts > now() - INTERVAL 1 DAY AND model != ''",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": "",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "status",
+        "label": "Status",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "clickhouse"
+        },
+        "query": "SELECT DISTINCT status FROM llm_requests WHERE ts > now() - INTERVAL 1 DAY",
+        "definition": "SELECT DISTINCT status FROM llm_requests WHERE ts > now() - INTERVAL 1 DAY",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": "",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "trace",
+        "label": "trace_id / request_id",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "observe-d",
+      "type": "dashboards",
+      "tags": [
+        "observe-d"
+      ],
+      "asDropdown": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "row",
+      "title": "Requests",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Requests by status",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "format": 0,
+          "rawSql": "SELECT toStartOfInterval(ts, INTERVAL $__interval_s SECOND) AS time, status, count() AS requests FROM llm_requests FINAL WHERE $__timeFilter(ts) AND (length([${org:singlequote}]) = 0 OR org_id IN (${org:singlequote})) AND (length([${model:singlequote}]) = 0 OR model IN (${model:singlequote})) AND (length([${status:singlequote}]) = 0 OR status IN (${status:singlequote})) GROUP BY time, status ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Join health (missing spans = broken propagation)",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "format": 0,
+          "rawSql": "SELECT minute AS time, missing_engine_span / greatest(routed, 1) AS missing_engine_span_ratio FROM join_health WHERE $__timeFilter(minute) ORDER BY minute",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "table",
+      "title": "Slowest / failed requests",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "table",
+          "format": 1,
+          "rawSql": "SELECT ts, trace_id, request_id, org_id, app_id, model, pod, status, finish_reason, tokens_in, tokens_cached, tokens_out, round(ttft_us / 1e3, 1) AS ttft_ms, round(tpot_us / 1e3, 2) AS tpot_ms, round(queue_us / 1e3, 1) AS queue_ms, round(gateway_us / 1e3, 1) AS gateway_ms, prefix_hit_predicted, prefix_hit_actual, preempted FROM llm_requests FINAL WHERE $__timeFilter(ts) AND (length([${org:singlequote}]) = 0 OR org_id IN (${org:singlequote})) AND (length([${model:singlequote}]) = 0 OR model IN (${model:singlequote})) AND (length([${status:singlequote}]) = 0 OR status IN (${status:singlequote})) ORDER BY status = 'ok', ttft_us DESC LIMIT 200",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "row",
+      "title": "Drill-down: set the trace_id / request_id variable",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "type": "table",
+      "title": "Request",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "table",
+          "format": 1,
+          "rawSql": "SELECT ts, trace_id, request_id, org_id, app_id, user_id, session_id, model, engine, pod, node, status, response_code, finish_reason, tokens_in, tokens_cached, tokens_out, gateway_us, routing_us, queue_us, prefill_us, decode_us, ttft_us, tpot_us, e2e_us, route_candidates, prefix_hit_predicted, prefix_hit_actual, fallback_reason, preempted, temperature, top_p, max_tokens FROM (SELECT * FROM llm_requests FINAL WHERE trace_id = '${trace}' OR request_id = '${trace}' ORDER BY version DESC LIMIT 1)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "table",
+      "title": "Spans (gateway \u2192 EPP \u2192 engine)",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "table",
+          "format": 1,
+          "rawSql": "SELECT Timestamp, ServiceName, SpanName, SpanKind, round(Duration / 1e6, 2) AS duration_ms, StatusCode, SpanId, ParentSpanId, SpanAttributes FROM otel_traces WHERE TraceId = (SELECT trace_id FROM llm_requests WHERE trace_id = '${trace}' OR request_id = '${trace}' LIMIT 1) ORDER BY Timestamp",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "table",
+      "title": "GPU state of the request's pod (\u00b130 s)",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "table",
+          "format": 1,
+          "rawSql": "SELECT ts, gpu_index, round(compute_active_percent, 1) AS compute_pct, round(mem_bw_active_percent, 1) AS hbm_bw_pct, round(power_watts) AS watts, round(temp_celsius, 1) AS temp_c, sm_clock_mhz, throttle_reasons FROM gpu_samples_v AS g, (SELECT * FROM llm_requests FINAL WHERE trace_id = '${trace}' OR request_id = '${trace}' ORDER BY version DESC LIMIT 1) AS r WHERE g.pod = r.pod AND g.ts BETWEEN toDateTime(r.ts) - 30 AND toDateTime(r.ts) + 30 ORDER BY ts, gpu_index",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "table",
+      "title": "Engine state at that time (\u00b160 s)",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "table",
+          "format": 1,
+          "rawSql": "SELECT toStartOfInterval(TimeUnix, INTERVAL 10 SECOND) AS t, MetricName, round(avg(Value), 3) AS value FROM otel_metrics_gauge AS m, (SELECT * FROM llm_requests FINAL WHERE trace_id = '${trace}' OR request_id = '${trace}' ORDER BY version DESC LIMIT 1) AS r WHERE m.MetricName LIKE 'llm.%' AND m.Attributes['pod'] = r.pod AND m.TimeUnix BETWEEN r.ts - INTERVAL 60 SECOND AND r.ts + INTERVAL 60 SECOND GROUP BY t, MetricName ORDER BY t, MetricName",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "table",
+      "title": "Kubernetes events for the pod (\u00b15 min)",
+      "description": "",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "clickhouse"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 39,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "clickhouse"
+          },
+          "editorType": "sql",
+          "queryType": "table",
+          "format": 1,
+          "rawSql": "SELECT e.ts, e.reason, e.type, e.message FROM k8s_events AS e, (SELECT * FROM llm_requests FINAL WHERE trace_id = '${trace}' OR request_id = '${trace}' ORDER BY version DESC LIMIT 1) AS r WHERE e.name = r.pod AND e.ts BETWEEN r.ts - INTERVAL 5 MINUTE AND r.ts + INTERVAL 5 MINUTE ORDER BY e.ts",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ]
+}

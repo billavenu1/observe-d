@@ -1,0 +1,109 @@
+# kube-prometheus-stack, slim local profile (8 GB WSL budget). Production overrides: retention, resources,
+# Alertmanager receivers, persistent storage.
+#   helm upgrade --install kps prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
+#     --version <versions.yaml> -f deploy/helm/kube-prometheus-stack-values.yaml
+
+fullnameOverride: kps
+
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeControllerManager: false
+    kubeProxy: false
+    windows: false
+
+kubeEtcd: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeProxy: {enabled: false}
+
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {memory: 96Mi}
+
+prometheus:
+  service:
+    type: NodePort
+    nodePort: 30090
+  prometheusSpec:
+    retention: 2d
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    ruleSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    resources:
+      requests: {cpu: 100m, memory: 384Mi}
+      limits: {memory: 1Gi}
+
+prometheusOperator:
+  resources:
+    requests: {cpu: 20m, memory: 48Mi}
+    limits: {memory: 160Mi}
+
+kube-state-metrics:
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {memory: 128Mi}
+
+prometheus-node-exporter:
+  hostRootFsMount: {enabled: false}   # kind on podman: no host rootfs propagation
+  resources:
+    requests: {cpu: 10m, memory: 24Mi}
+    limits: {memory: 64Mi}
+
+grafana:
+  adminPassword: admin
+  service:
+    type: NodePort
+    nodePort: 30300
+  persistence: {enabled: false}
+  # plugin loading is slow on small dev machines; don't let liveness kill it mid-start
+  livenessProbe:
+    httpGet: {path: /api/health, port: 3000}
+    initialDelaySeconds: 300
+    timeoutSeconds: 30
+    failureThreshold: 10
+  readinessProbe:
+    httpGet: {path: /api/health, port: 3000}
+    periodSeconds: 10
+  resources:
+    requests: {cpu: 50m, memory: 192Mi}
+    limits: {memory: 768Mi}   # ClickHouse plugin + dashboards OOM at 384Mi
+  plugins:
+    - grafana-clickhouse-datasource
+  grafana.ini:
+    auth.anonymous: {enabled: true, org_role: Viewer}
+    dashboards: {default_home_dashboard_path: /tmp/dashboards/observe-d/00-overview.json}
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider: {foldersFromFilesStructure: true}
+    alerts:
+      enabled: true
+      label: grafana_alert
+      labelValue: "1"
+      searchNamespace: ALL
+  additionalDataSources:
+    - name: ClickHouse
+      uid: clickhouse
+      type: grafana-clickhouse-datasource
+      jsonData:
+        host: "__CLICKHOUSE_IP__"
+        port: 9000
+        protocol: native
+        username: otel
+        defaultDatabase: otel
+      secureJsonData:
+        password: otel

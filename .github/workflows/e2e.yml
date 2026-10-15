@@ -1,0 +1,55 @@
+name: e2e
+
+# Full stack on a GitHub runner (Docker instead of Podman): kind "GPU node" with the simulators,
+# compose backend, kube-prometheus-stack. Runs the SQL tests and checks every dashboard panel query.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+  pull_request:
+    types: [labeled, synchronize]
+
+jobs:
+  e2e:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        vendor: [amd, nvidia]
+    env:
+      CONTAINER_CLI: docker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - name: install kind, kubectl, helm (versions.yaml)
+        run: |
+          mkdir -p .tools/bin
+          curl -sSfLo .tools/bin/kind https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          curl -sSfLo .tools/bin/kubectl https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubectl
+          curl -sSfL https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz | tar -xz -C .tools/bin --strip-components=1 linux-amd64/helm
+          chmod +x .tools/bin/*
+      - name: bring up the stack
+        run: uv run python -m tools.dev up --vendor ${{ matrix.vendor }} --rate 15
+      - name: wait for joined requests and tokenomics
+        run: |
+          for i in $(seq 1 60); do
+            n=$(curl -s "http://localhost:8123/?user=otel&password=otel" \
+                  --data "SELECT count() FROM otel.tokenomics_hourly FINAL WHERE requests > 0")
+            [ "${n:-0}" -gt 0 ] && exit 0
+            sleep 10
+          done
+          exit 1
+      - run: uv run pytest -m sql
+      - run: uv run pytest -m e2e
+      - name: diagnostics
+        if: failure()
+        run: |
+          export PATH="$PWD/.tools/bin:$PATH"
+          kubectl --context kind-observe-d get pods -A -o wide || true
+          kubectl --context kind-observe-d -n observe-d logs ds/otel-agent --tail=100 || true
+          docker logs od-otel-gateway --tail=100 || true
+          curl -s "http://localhost:8123/?user=otel&password=otel" \
+            --data "SELECT view, status, exception FROM system.view_refreshes FORMAT PrettyCompact" || true

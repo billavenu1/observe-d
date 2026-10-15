@@ -1,0 +1,131 @@
+# Inference engine -> normalized `llm` vocabulary (MVP.md §3.5). Same rules as gpu.yaml.
+# vLLM names follow vLLM's Prometheus endpoint (v1 metric names; verify on the pinned version).
+# SGLang is declared now (all null) so adding it later is a mapping-only change.
+# clickhouse: false keeps a metric in Prometheus only (histograms are queried with PromQL; per-request
+# latency for SQL comes from the request spans in llm_requests).
+
+namespace: llm
+discriminator_label: engine
+vendors: [vllm, sglang]
+
+labels:
+  vllm:
+    model_name: model
+    pod: pod
+    namespace: namespace
+  sglang:
+    model_name: model
+    pod: pod
+    namespace: namespace
+
+metrics:
+  requests_running:
+    type: gauge
+    unit: requests
+    description: Requests currently in the running batch
+    vllm: {metric: "vllm:num_requests_running"}
+    sglang: null
+
+  requests_waiting:
+    type: gauge
+    unit: requests
+    description: Requests queued in the engine scheduler
+    vllm: {metric: "vllm:num_requests_waiting"}
+    sglang: null
+
+  kv_cache_usage_percent:
+    type: gauge
+    unit: percent
+    description: KV-cache blocks in use
+    vllm: {metric: "vllm:kv_cache_usage_perc", scale: 100}
+    sglang: null
+
+  prefix_cache_queries_total:
+    type: counter
+    unit: tokens
+    description: Tokens looked up in the prefix cache
+    vllm: {metric: "vllm:prefix_cache_queries_total"}
+    sglang: null
+
+  prefix_cache_hits_total:
+    type: counter
+    unit: tokens
+    description: Tokens served from the prefix cache
+    vllm: {metric: "vllm:prefix_cache_hits_total"}
+    sglang: null
+
+  preemptions_total:
+    type: counter
+    unit: events
+    description: Sequences preempted (KV pressure -> recompute)
+    vllm: {metric: "vllm:num_preemptions_total"}
+    sglang: null
+
+  prompt_tokens_total:
+    type: counter
+    unit: tokens
+    description: Prompt tokens processed
+    vllm: {metric: "vllm:prompt_tokens_total"}
+    sglang: null
+
+  generation_tokens_total:
+    type: counter
+    unit: tokens
+    description: Tokens generated
+    vllm: {metric: "vllm:generation_tokens_total"}
+    sglang: null
+
+  requests_finished_total:
+    type: counter
+    unit: requests
+    description: Finished requests by finished_reason (stop / length / abort / error)
+    vllm: {metric: "vllm:request_success_total"}
+    sglang: null
+
+  ttft_seconds:
+    type: histogram
+    unit: seconds
+    description: Time to first token
+    clickhouse: false
+    vllm: {metric: "vllm:time_to_first_token_seconds", kind: histogram}
+    sglang: null
+
+  itl_seconds:
+    type: histogram
+    unit: seconds
+    description: Inter-token latency
+    clickhouse: false
+    vllm: {metric: "vllm:inter_token_latency_seconds", kind: histogram}
+    sglang: null
+
+  e2e_seconds:
+    type: histogram
+    unit: seconds
+    description: End-to-end request latency inside the engine
+    clickhouse: false
+    vllm: {metric: "vllm:e2e_request_latency_seconds", kind: histogram}
+    sglang: null
+
+  queue_seconds:
+    type: histogram
+    unit: seconds
+    description: Time waiting in the engine queue
+    clickhouse: false
+    vllm: {metric: "vllm:request_queue_time_seconds", kind: histogram}
+    sglang: null
+
+  prefill_seconds:
+    type: histogram
+    unit: seconds
+    description: Prefill time
+    clickhouse: false
+    vllm: {metric: "vllm:request_prefill_time_seconds", kind: histogram}
+    sglang: null
+
+  decode_seconds:
+    type: histogram
+    unit: seconds
+    description: Decode time
+    clickhouse: false
+    vllm: {metric: "vllm:request_decode_time_seconds", kind: histogram}
+    sglang: null

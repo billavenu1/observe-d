@@ -1,0 +1,61 @@
+# Single source of truth for every image, chart and engine version.
+# compose, kind manifests, Helm values and docs read from here (tools/dev.py renders them).
+#
+# verified: true  -> release confirmed to exist (date noted)
+# verified: false -> placeholder; must be confirmed against the upstream release page in M1
+#                    before anything depends on it (metric names differ between versions).
+
+clickhouse:
+  image: clickhouse/clickhouse-server
+  tag: "26.3"            # 26.3 LTS (Mar 2026), patched through mid-2026; refreshable MVs are GA
+  verified: true
+
+kafka:
+  image: apache/kafka
+  tag: "4.1.0"           # KRaft only (ZooKeeper removed in 4.0)
+  verified: true
+
+otel_collector_contrib:
+  image: otel/opentelemetry-collector-contrib
+  tag: "0.156.0"         # Jul 2026
+  verified: true
+
+vllm:
+  cuda_image: vllm/vllm-openai
+  cuda_tag: "v0.28.0"    # Aug 2026
+  rocm_image: rocm/vllm   # ROCm build; exact tag must match the vLLM version above
+  rocm_tag: "TBD"
+  verified: false        # cuda tag confirmed to exist; ROCm tag TBD; metric names verified in M1 spike
+
+llm_d:
+  release: "v0.9.0"      # latest on github.com/llm-d/llm-d/releases at time of writing
+  inference_sim_image: ghcr.io/llm-d/llm-d-inference-sim
+  inference_sim_tag: "TBD"   # take from the v0.9.0 component table
+  gateway_provider: "TBD"    # istio | kgateway — whichever the v0.9.0 quickstart supports
+  verified: false
+
+kube_prometheus_stack:
+  chart: prometheus-community/kube-prometheus-stack
+  version: "92.4.0"      # operator v0.94.1
+  verified: true
+
+grafana_clickhouse_plugin:
+  id: grafana-clickhouse-datasource
+  version: "TBD"
+  verified: false
+
+nvidia_gpu_operator:
+  chart: nvidia/gpu-operator     # includes dcgm-exporter
+  version: "TBD"
+  verified: false
+
+amd_gpu_operator:
+  chart: rocm/gpu-operator-charts  # includes the AMD Device Metrics Exporter
+  version: "TBD"
+  verified: false
+
+kind:
+  version: "v0.33.0"     # node image default for this release: Kubernetes v1.37.0
+  kubectl: "v1.37.1"
+  helm: "v4.3.0"
+  verified: true

@@ -1,0 +1,147 @@
+# observe-d alert rules (MVP.md §3 per layer). All use normalized names, so they work on NVIDIA and AMD.
+# Every rule carries observe_d="true" so the overview dashboard can list firing alerts.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: observe-d-alerts
+  labels: {app.kubernetes.io/part-of: observe-d}
+spec:
+  groups:
+    - name: observe-d-gpu
+      rules:
+        - alert: GPUFatalEvent
+          expr: gpu:last_fatal_event_code > 0
+          labels: {severity: critical, layer: gpu, observe_d: "true"}
+          annotations:
+            summary: "GPU {{ $labels.gpu_index }} on {{ $labels.node }} reported fatal event {{ $value }} (Xid)"
+            runbook: "Drain the node; Xid 79 = GPU fell off the bus. See docs/runbook.md#gpu-fatal-event"
+        - alert: GPUUncorrectableECC
+          expr: gpu:ecc_uncorrectable_total > 0
+          labels: {severity: critical, layer: gpu, observe_d: "true"}
+          annotations:
+            summary: "GPU {{ $labels.gpu_index }} on {{ $labels.node }} has uncorrectable memory errors"
+        - alert: GPURowRemapFailed
+          expr: gpu:row_remap_failed > 0
+          labels: {severity: critical, layer: gpu, observe_d: "true"}
+          annotations:
+            summary: "GPU {{ $labels.gpu_index }} on {{ $labels.node }}: HBM row remapping failed -> replace GPU"
+        - alert: GPUOverTemperature
+          expr: gpu:temp_celsius > 85
+          for: 5m
+          labels: {severity: warning, layer: gpu, observe_d: "true"}
+          annotations:
+            summary: "GPU {{ $labels.gpu_index }} on {{ $labels.node }} at {{ $value }}°C"
+        - alert: GPUThermalThrottling
+          expr: max by (node, gpu_index, gpu_uuid) (gpu:throttle_active{reason=~"hw_thermal|sw_thermal|hw_slowdown"}) == 1
+          for: 5m
+          labels: {severity: warning, layer: gpu, observe_d: "true"}
+          annotations:
+            summary: "GPU {{ $labels.gpu_index }} on {{ $labels.node }} is clock-throttling"
+        - alert: GPUPCIeReplays
+          expr: increase(gpu:pcie_replay_total[10m]) > 0
+          labels: {severity: warning, layer: network, observe_d: "true"}
+          annotations:
+            summary: "PCIe replays on GPU {{ $labels.gpu_index }} ({{ $labels.node }}): degraded host link"
+        - alert: GPUMissing
+          expr: count by (node) (gpu:power_watts) < on (node) group_left() sum by (node) (k8s:gpu_allocatable)
+          for: 5m
+          labels: {severity: critical, layer: gpu, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.node }} reports fewer GPUs than allocatable"
+
+    - name: observe-d-k8s
+      rules:
+        - alert: GPUPodPending
+          expr: sum by (namespace, pod) (k8s:gpu_requested_by_pod * on (namespace, pod) group_left() kube_pod_status_phase{phase="Pending"}) > 0
+          for: 5m
+          labels: {severity: warning, layer: k8s, observe_d: "true"}
+          annotations:
+            summary: "GPU pod {{ $labels.namespace }}/{{ $labels.pod }} pending > 5 min (insufficient GPUs?)"
+        - alert: InferencePodRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="llm"}[15m]) > 3
+          labels: {severity: warning, layer: k8s, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.pod }} restarted {{ $value }} times in 15 min"
+        - alert: InferencePodOOMKilled
+          expr: increase(kube_pod_container_status_restarts_total{namespace="llm"}[10m]) > 0 and on (namespace, pod, container) kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+          labels: {severity: warning, layer: k8s, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.pod }} was OOMKilled"
+
+    - name: observe-d-gateway-llmd
+      rules:
+        - alert: GatewayErrorRateHigh
+          expr: |
+            sum(rate(inference_objective_request_error_total{error_code=~"5.."}[5m]))
+              / clamp_min(sum(rate(inference_objective_request_total[5m])), 1e-9) > 0.01
+          for: 5m
+          labels: {severity: warning, layer: network, observe_d: "true"}
+          annotations:
+            summary: "Gateway 5xx rate {{ $value | humanizePercentage }}"
+        - alert: NoEndpointAvailable
+          expr: sum(rate(llm_d_epp_no_endpoint_available_total[5m])) > 0
+          for: 2m
+          labels: {severity: critical, layer: llm-d, observe_d: "true"}
+          annotations:
+            summary: "llm-d EPP has no endpoint for some requests"
+        - alert: EngineQueueSkew
+          expr: max by (model) (llm:requests_waiting) - min by (model) (llm:requests_waiting) > 16
+          for: 5m
+          labels: {severity: warning, layer: llm-d, observe_d: "true"}
+          annotations:
+            summary: "Queue skew {{ $value }} across {{ $labels.model }} pods: routing imbalance"
+        - alert: EPPDecisionSlow
+          expr: histogram_quantile(0.99, sum by (le) (rate(llm_d_epp_routing_decision_duration_seconds_bucket[5m]))) > 0.05
+          for: 5m
+          labels: {severity: warning, layer: llm-d, observe_d: "true"}
+          annotations:
+            summary: "EPP routing decision p99 {{ $value }}s"
+
+    - name: observe-d-engine
+      rules:
+        - alert: KVCacheSaturated
+          expr: llm:kv_cache_usage_percent > 90
+          for: 10m
+          labels: {severity: warning, layer: vllm, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.pod }} KV cache {{ $value }}% for 10 min"
+        - alert: EnginePreempting
+          expr: rate(llm:preemptions_total[5m]) > 0.2
+          for: 5m
+          labels: {severity: warning, layer: vllm, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.pod }} preempting {{ $value }}/s (KV pressure, recompute waste)"
+        - alert: EngineQueueGrowing
+          expr: llm:requests_waiting > 10 and deriv(llm:requests_waiting[5m]) > 0
+          for: 5m
+          labels: {severity: warning, layer: vllm, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.pod }} waiting queue {{ $value }} and growing"
+        - alert: TTFTSLOBreach
+          expr: histogram_quantile(0.95, sum by (le, model) (rate(llm:ttft_seconds_bucket[5m]))) > 1
+          for: 5m
+          labels: {severity: warning, layer: vllm, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.model }} TTFT p95 {{ $value }}s > 1s"
+        - alert: ITLSLOBreach
+          expr: histogram_quantile(0.95, sum by (le, model) (rate(llm:itl_seconds_bucket[5m]))) > 0.1
+          for: 5m
+          labels: {severity: warning, layer: vllm, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.model }} inter-token latency p95 {{ $value }}s > 100ms"
+        - alert: EngineErrorRate
+          expr: |
+            sum by (model) (rate(llm:requests_finished_total{finished_reason="error"}[5m]))
+              / clamp_min(sum by (model) (rate(llm:requests_finished_total[5m])), 1e-9) > 0.01
+          for: 5m
+          labels: {severity: warning, layer: vllm, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.model }} engine error rate {{ $value | humanizePercentage }}"
+        - alert: RunawayGeneration
+          expr: |
+            sum by (model) (rate(llm:requests_finished_total{finished_reason="length"}[15m]))
+              / clamp_min(sum by (model) (rate(llm:requests_finished_total[15m])), 1e-9) > 0.5
+          for: 15m
+          labels: {severity: info, layer: tokenomics, observe_d: "true"}
+          annotations:
+            summary: "{{ $labels.model }}: most requests stop at max_tokens"

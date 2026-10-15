@@ -1,0 +1,96 @@
+# OTel Collector GATEWAY: Kafka -> ClickHouse. Runs on CPU nodes (compose locally, Deployment in prod).
+# Scale by adding replicas: they share the consumer group, so Kafka partitions are spread across them.
+
+receivers:
+  kafka:
+    brokers: ["${env:KAFKA_BROKERS}"]
+    group_id: observe-d-gateway
+    logs: {topics: [otlp_logs], encoding: otlp_proto}
+    metrics: {topics: [otlp_metrics], encoding: otlp_proto}
+    traces: {topics: [otlp_traces], encoding: otlp_proto}
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  # Large inserts keep ClickHouse part counts low (MVP.md §2.1). Local values are smaller.
+  batch:
+    send_batch_size: 20000
+    send_batch_max_size: 40000
+    timeout: 5s
+
+connectors:
+  # Gateway access logs feed gateway_requests via a Null table; everything else goes to otel_logs.
+  routing/logs:
+    default_pipelines: [logs/otel]
+    table:
+      - context: log
+        condition: attributes["log.source"] == "gateway_access"
+        pipelines: [logs/gateway_access]
+
+exporters:
+  clickhouse:
+    endpoint: "${env:CLICKHOUSE_ENDPOINT}"
+    username: "${env:CLICKHOUSE_USER}"
+    password: "${env:CLICKHOUSE_PASSWORD}"
+    database: otel
+    create_schema: false
+    async_insert: true
+    # default 5 s timed out under load while the insert still succeeded -> retries wrote duplicates
+    timeout: 60s
+    logs_table_name: otel_logs
+    traces_table_name: otel_traces
+    metrics_tables:
+      gauge: {name: otel_metrics_gauge}
+      sum: {name: otel_metrics_sum}
+      histogram: {name: otel_metrics_histogram}
+      exponential_histogram: {name: otel_metrics_exponential_histogram}
+      summary: {name: otel_metrics_summary}
+    retry_on_failure: {enabled: true, initial_interval: 5s, max_interval: 30s, max_elapsed_time: 0s}
+    sending_queue: {enabled: true, queue_size: 1000}
+  clickhouse/gateway_access:
+    endpoint: "${env:CLICKHOUSE_ENDPOINT}"
+    username: "${env:CLICKHOUSE_USER}"
+    password: "${env:CLICKHOUSE_PASSWORD}"
+    database: otel
+    create_schema: false
+    async_insert: true
+    # default 5 s timed out under load while the insert still succeeded -> retries wrote duplicates
+    timeout: 60s
+    logs_table_name: gateway_access_null
+    retry_on_failure: {enabled: true, initial_interval: 5s, max_interval: 30s, max_elapsed_time: 0s}
+    sending_queue: {enabled: true, queue_size: 1000}
+
+extensions:
+  health_check: {endpoint: 0.0.0.0:13133}
+
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus: {host: 0.0.0.0, port: 8888}
+  pipelines:
+    logs/in:
+      receivers: [kafka]
+      processors: [memory_limiter]
+      exporters: [routing/logs]
+    logs/otel:
+      receivers: [routing/logs]
+      processors: [batch]
+      exporters: [clickhouse]
+    logs/gateway_access:
+      receivers: [routing/logs]
+      processors: [batch]
+      exporters: [clickhouse/gateway_access]
+    metrics:
+      receivers: [kafka]
+      processors: [memory_limiter, batch]
+      exporters: [clickhouse]
+    traces:
+      receivers: [kafka]
+      processors: [memory_limiter, batch]
+      exporters: [clickhouse]

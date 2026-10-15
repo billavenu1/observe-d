@@ -1,0 +1,238 @@
+# Simulated GPU node workload: fake GPU exporter + simulated llm-d stack (gateway/EPP, vLLM engines, loadgen).
+# Placeholders (__GPU_VENDOR__, __GPU_RESOURCE__, ...) are filled in by tools/dev.py.
+#
+# GPU layout on the 8-GPU node:  llama-3.1-70b x1 (TP=4)  +  qwen2.5-7b x2 (TP=1)  ->  6 allocated, 2 idle.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: fake-gpu-exporter, namespace: observe-d}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: observe-d-fake-gpu-exporter}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: observe-d-fake-gpu-exporter}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: observe-d-fake-gpu-exporter}
+subjects: [{kind: ServiceAccount, name: fake-gpu-exporter, namespace: observe-d}]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: fake-gpu-exporter, namespace: observe-d}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: fake-gpu-exporter}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: fake-gpu-exporter, observe-d.io/role: gpu-exporter}
+      annotations: {observe-d.io/scrape: gpu, observe-d.io/port: "9400"}
+    spec:
+      serviceAccountName: fake-gpu-exporter
+      nodeSelector: {observe-d/gpu-node: "true"}
+      containers:
+        - name: exporter
+          image: localhost/observe-d-sim:dev
+          imagePullPolicy: Never
+          args: [sim.fake_gpu_exporter, --vendor, __GPU_VENDOR__, --k8s, --port, "9400"]
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - {name: SCENARIO, value: load}
+          ports: [{name: metrics, containerPort: 9400}]
+          resources:
+            requests: {cpu: 20m, memory: 48Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: sim-common, namespace: llm}
+data:
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-agent.observe-d.svc.cluster.local:4317
+  GPU_VENDOR: __GPU_VENDOR__
+---
+apiVersion: v1
+kind: Service
+metadata: {name: vllm-engines, namespace: llm}
+spec:
+  clusterIP: None   # headless: the gateway/EPP discovers every engine pod
+  selector: {observe-d.io/role: engine}
+  ports: [{name: http, port: 8000}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: vllm-llama-70b, namespace: llm}
+spec:
+  strategy: {type: Recreate}   # GPU pods: a surge pod would not fit on the node
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: vllm-llama-70b}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: vllm-llama-70b, observe-d.io/role: engine}
+      annotations: {observe-d.io/scrape: engine, observe-d.io/port: "8000"}
+    spec:
+      containers:
+        -
+          name: vllm
+          image: localhost/observe-d-sim:dev
+          imagePullPolicy: Never
+          args: [sim.inference_stack, engine, --port, "8000"]
+          envFrom: [{configMapRef: {name: sim-common}}]
+          env:
+            - {name: MODEL, value: llama-3.1-70b-instruct}
+            - {name: TP, value: "4"}
+            - {name: MAX_NUM_SEQS, value: "128"}
+            - {name: ITL_MS, value: "28"}
+            - {name: KV_CAPACITY_TOKENS, value: "400000"}
+            - {name: SCENARIO, value: normal}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe: {httpGet: {path: /health, port: 8000}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi, __GPU_RESOURCE__: 4}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: vllm-qwen-7b, namespace: llm}
+spec:
+  strategy: {type: Recreate}   # GPU pods: a surge pod would not fit on the node
+  replicas: 2
+  selector: {matchLabels: {app.kubernetes.io/name: vllm-qwen-7b}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: vllm-qwen-7b, observe-d.io/role: engine}
+      annotations: {observe-d.io/scrape: engine, observe-d.io/port: "8000"}
+    spec:
+      containers:
+        - name: vllm
+          image: localhost/observe-d-sim:dev
+          imagePullPolicy: Never
+          args: [sim.inference_stack, engine, --port, "8000"]
+          envFrom: [{configMapRef: {name: sim-common}}]
+          env:
+            - {name: MODEL, value: qwen2.5-7b-instruct}
+            - {name: TP, value: "1"}
+            - {name: MAX_NUM_SEQS, value: "64"}
+            - {name: ITL_MS, value: "12"}
+            - {name: KV_CAPACITY_TOKENS, value: "150000"}
+            - {name: SCENARIO, value: normal}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe: {httpGet: {path: /health, port: 8000}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi, __GPU_RESOURCE__: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: inference-gateway, namespace: llm}
+spec:
+  selector: {app.kubernetes.io/name: inference-gateway}
+  ports: [{name: http, port: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: inference-gateway, namespace: llm}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: inference-gateway}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: inference-gateway, observe-d.io/role: gateway}
+    spec:
+      containers:
+        - name: gateway
+          image: localhost/observe-d-sim:dev
+          imagePullPolicy: Never
+          args: [sim.inference_stack, gateway, --port, "8080"]
+          envFrom: [{configMapRef: {name: sim-common}}]
+          env:
+            - {name: ENGINE_DISCOVERY, value: "vllm-engines.llm.svc.cluster.local:8000"}
+            - {name: POOL_NAME, value: llm-pool}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /health, port: 8080}}
+          resources:
+            requests: {cpu: 100m, memory: 96Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: loadgen, namespace: llm}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: loadgen}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: loadgen}
+    spec:
+      containers:
+        - name: loadgen
+          image: localhost/observe-d-sim:dev
+          imagePullPolicy: Never
+          args: [sim.inference_stack, loadgen]
+          envFrom: [{configMapRef: {name: sim-common}}]
+          env:
+            - {name: TARGET, value: "http://inference-gateway.llm.svc.cluster.local:8080"}
+            - {name: RATE, value: "__LOAD_RATE__"}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          resources:
+            requests: {cpu: 100m, memory: 96Mi}
+            limits: {memory: 256Mi}
+---
+# Prometheus scrapes everything at full fidelity (kube-prometheus-stack PodMonitors).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: {name: gpu-exporter, namespace: observe-d}
+spec:
+  selector: {matchLabels: {observe-d.io/role: gpu-exporter}}
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 10s
+      honorLabels: true
+      # pod/namespace/container must name the GPU's *consumer* pod (set by the exporter), never the
+      # exporter pod itself: drop the target labels the operator adds.
+      relabelings:
+        - {action: labeldrop, regex: "pod|container|namespace"}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: {name: llm-engines, namespace: llm}
+spec:
+  selector: {matchLabels: {observe-d.io/role: engine}}
+  podMetricsEndpoints:
+    - {port: http, interval: 10s}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata: {name: inference-gateway, namespace: llm}
+spec:
+  selector: {matchLabels: {observe-d.io/role: gateway}}
+  podMetricsEndpoints:
+    - {port: http, interval: 10s}

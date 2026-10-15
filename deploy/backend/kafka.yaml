@@ -1,0 +1,82 @@
+# Kafka (KRaft) via the Strimzi operator — sized for 5k req/s sustained / 7k burst (MVP.md §2.1).
+# Prereq: Strimzi operator installed and watching the `observability` namespace.
+# MVP: 1 combined controller+broker, RF 1 (single point of failure, accepted for the MVP).
+# Production: replicas: 3 and replication factor 3 (PLAN.md §10.1) — change the three marked lines.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaNodePool
+metadata:
+  name: dual
+  namespace: observability
+  labels: {strimzi.io/cluster: observe-d}
+spec:
+  replicas: 1                      # production: 3
+  roles: [controller, broker]
+  resources:
+    requests: {cpu: "4", memory: 16Gi}
+    limits: {memory: 32Gi}
+  jvmOptions: {"-Xms": 8g, "-Xmx": 8g}
+  storage:
+    type: jbod
+    volumes:
+      - {id: 0, type: persistent-claim, size: 2Ti, deleteClaim: false, kraftMetadata: shared}
+  template:
+    pod:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: observe-d/role, operator: In, values: [observability]}   # CPU nodes only
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: observe-d
+  namespace: observability
+  annotations:
+    strimzi.io/node-pools: enabled
+    strimzi.io/kraft: enabled
+spec:
+  kafka:
+    version: 4.1.0
+    listeners:
+      - {name: plain, port: 9092, type: internal, tls: false}
+    config:
+      default.replication.factor: 1         # production: 3
+      min.insync.replicas: 1
+      offsets.topic.replication.factor: 1   # production: 3
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      auto.create.topics.enable: false
+      compression.type: producer
+      message.max.bytes: 8388608
+  entityOperator:
+    topicOperator: {}
+---
+# 24 partitions: up to 24 gateway-collector consumers. 24 h retention covers a day-long ClickHouse outage.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata: {name: otlp-traces, namespace: observability, labels: {strimzi.io/cluster: observe-d}}
+spec:
+  topicName: otlp_traces
+  partitions: 24
+  replicas: 1
+  config: {retention.ms: 86400000, compression.type: zstd, max.message.bytes: 8388608}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata: {name: otlp-logs, namespace: observability, labels: {strimzi.io/cluster: observe-d}}
+spec:
+  topicName: otlp_logs
+  partitions: 24
+  replicas: 1
+  config: {retention.ms: 86400000, compression.type: zstd, max.message.bytes: 8388608}
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata: {name: otlp-metrics, namespace: observability, labels: {strimzi.io/cluster: observe-d}}
+spec:
+  topicName: otlp_metrics
+  partitions: 24
+  replicas: 1
+  config: {retention.ms: 86400000, compression.type: zstd, max.message.bytes: 8388608}

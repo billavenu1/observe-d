@@ -1,0 +1,197 @@
+# Vendor → normalized GPU metric vocabulary (MVP.md §3.1).
+#
+# Single source of truth. `python -m normalize.generate` turns this into:
+#   prometheus/rules/gpu-normalized.yaml     PrometheusRule recording rules  -> gpu:<name>
+#   collector/generated/gpu-transform.yaml   collector processors (ClickHouse subset) -> gpu.<name>
+# Dashboards, alerts and SQL use ONLY the normalized names.
+#
+# Per vendor source:
+#   metric       vendor metric name as exposed by the exporter
+#   scale        multiply to reach the normalized unit (e.g. ratio→percent = 100, MiB→bytes = 1048576)
+#   selector     label matchers to pick one series family (e.g. AMD clock_type)
+#   kind         value (default) | bitmask (expanded into one 0/1 series per `reasons` bit)
+#   approximate  true when the vendor has no exact equivalent (excluded from cross-vendor equality checks)
+#   verified     true only once checked against real exporter output (M8 AMD, M9 NVIDIA)
+# A vendor set to null has no equivalent: dashboards show "n/a", never 0.
+
+namespace: gpu
+discriminator_label: vendor
+vendors: [nvidia, amd]
+
+# source label -> normalized label, per vendor
+labels:
+  nvidia:
+    gpu: gpu_index
+    UUID: gpu_uuid
+    modelName: gpu_model
+    Hostname: node
+    pod: pod
+    namespace: namespace
+    container: container
+  amd:
+    gpu_id: gpu_index
+    gpu_uuid: gpu_uuid
+    card_model: gpu_model
+    hostname: node
+    pod: pod
+    namespace: namespace
+    container: container
+
+metrics:
+  busy_percent:
+    type: gauge
+    unit: percent
+    description: Time any kernel was running (coarse; not compute efficiency)
+    nvidia: {metric: DCGM_FI_DEV_GPU_UTIL, verified: true}
+    amd: {metric: gpu_gfx_activity, approximate: true}
+
+  compute_active_percent:
+    type: gauge
+    unit: percent
+    description: Real compute engagement (SM active / GFX activity)
+    nvidia: {metric: DCGM_FI_PROF_SM_ACTIVE, scale: 100, verified: true}
+    amd: {metric: gpu_gfx_activity}
+
+  matrix_active_percent:
+    type: gauge
+    unit: percent
+    description: Tensor-core / matrix-core pipe activity
+    nvidia: {metric: DCGM_FI_PROF_PIPE_TENSOR_ACTIVE, scale: 100, verified: true}
+    amd: {metric: gpu_mma_activity}
+
+  mem_bw_active_percent:
+    type: gauge
+    unit: percent
+    description: HBM bandwidth utilization (decode is memory-bound)
+    nvidia: {metric: DCGM_FI_PROF_DRAM_ACTIVE, scale: 100, verified: true}
+    amd: {metric: gpu_umc_activity}
+
+  mem_used_bytes:
+    type: gauge
+    unit: bytes
+    description: HBM in use
+    nvidia: {metric: DCGM_FI_DEV_FB_USED, scale: 1048576, verified: true}
+    amd: {metric: gpu_used_vram, scale: 1048576}
+
+  mem_total_bytes:
+    type: gauge
+    unit: bytes
+    description: HBM capacity (80 GB H100 / 192 GB MI300X); DCGM field must be added to the exporter CSV
+    nvidia: {metric: DCGM_FI_DEV_FB_TOTAL, scale: 1048576}
+    amd: {metric: gpu_total_vram, scale: 1048576}
+
+  power_watts:
+    type: gauge
+    unit: watts
+    description: Board / package power draw
+    nvidia: {metric: DCGM_FI_DEV_POWER_USAGE, verified: true}
+    amd: {metric: gpu_power_usage}
+
+  energy_joules_total:
+    type: counter
+    unit: joules
+    description: Cumulative energy (for J/token)
+    nvidia: {metric: DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, scale: 0.001, verified: true}
+    amd: {metric: gpu_energy_consumed}
+
+  temp_celsius:
+    type: gauge
+    unit: celsius
+    description: GPU core / junction (hotspot) temperature
+    nvidia: {metric: DCGM_FI_DEV_GPU_TEMP, verified: true}
+    amd: {metric: gpu_junction_temperature, approximate: true}
+
+  mem_temp_celsius:
+    type: gauge
+    unit: celsius
+    description: HBM temperature
+    nvidia: {metric: DCGM_FI_DEV_MEMORY_TEMP, verified: true}
+    amd: {metric: gpu_memory_temperature}
+
+  sm_clock_mhz:
+    type: gauge
+    unit: mhz
+    description: Compute clock
+    nvidia: {metric: DCGM_FI_DEV_SM_CLOCK, verified: true}
+    amd: {metric: gpu_clock, selector: {clock_type: GPU_CLOCK_TYPE_SYSTEM}}
+
+  throttle_active:
+    type: gauge
+    unit: bool
+    description: Clock throttling by reason (1 = active)
+    nvidia:
+      metric: DCGM_FI_DEV_CLOCKS_EVENT_REASONS
+      kind: bitmask
+      reasons:
+        0: gpu_idle
+        1: app_clock_setting
+        2: sw_power_cap
+        3: hw_slowdown
+        4: sync_boost
+        5: sw_thermal
+        6: hw_thermal
+        7: hw_power_brake
+    amd: null
+
+  ecc_correctable_total:
+    type: counter
+    unit: errors
+    description: Correctable (single-bit) memory errors
+    nvidia: {metric: DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, verified: true}
+    amd: {metric: gpu_ecc_correct_total}
+
+  ecc_uncorrectable_total:
+    type: counter
+    unit: errors
+    description: Uncorrectable (double-bit) memory errors -> drain the node
+    nvidia: {metric: DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, verified: true}
+    amd: {metric: gpu_ecc_uncorrect_total}
+
+  last_fatal_event_code:
+    type: gauge
+    unit: code
+    description: Last Xid (NVIDIA). AMD RAS events come from kernel logs instead.
+    nvidia: {metric: DCGM_FI_DEV_XID_ERRORS, verified: true}
+    amd: null
+
+  row_remap_failed:
+    type: gauge
+    unit: bool
+    description: HBM row remapping failed (NVIDIA) -> replace GPU
+    nvidia: {metric: DCGM_FI_DEV_ROW_REMAP_FAILURE, verified: true}
+    amd: null
+
+  pcie_tx_bytes_per_second:
+    type: gauge
+    unit: bytes_per_second
+    description: Host link transmit
+    nvidia: {metric: DCGM_FI_PROF_PCIE_TX_BYTES, verified: true}
+    amd: null
+
+  pcie_rx_bytes_per_second:
+    type: gauge
+    unit: bytes_per_second
+    description: Host link receive
+    nvidia: {metric: DCGM_FI_PROF_PCIE_RX_BYTES, verified: true}
+    amd: null
+
+  pcie_replay_total:
+    type: counter
+    unit: events
+    description: PCIe replays (link quality)
+    nvidia: {metric: DCGM_FI_DEV_PCIE_REPLAY_COUNTER, verified: true}
+    amd: {metric: pcie_replay_count}
+
+  link_tx_bytes_per_second:
+    type: gauge
+    unit: bytes_per_second
+    description: GPU-to-GPU fabric transmit (NVLink / xGMI), per GPU
+    nvidia: {metric: DCGM_FI_PROF_NVLINK_TX_BYTES, verified: true}
+    amd: {metric: gpu_xgmi_link_tx}
+
+  link_rx_bytes_per_second:
+    type: gauge
+    unit: bytes_per_second
+    description: GPU-to-GPU fabric receive (NVLink / xGMI), per GPU
+    nvidia: {metric: DCGM_FI_PROF_NVLINK_RX_BYTES, verified: true}
+    amd: {metric: gpu_xgmi_link_rx}
