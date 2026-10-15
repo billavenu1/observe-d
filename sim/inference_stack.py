@@ -4,11 +4,19 @@ The simulators emit the telemetry *shapes* the real components emit (or that obs
 
   engine   vLLM-like: /metrics with vllm:* series; one OTLP span `llm_request` per request with vLLM's
            gen_ai.* attributes (parented on the incoming traceparent); startup + NCCL/RCCL logs.
+           ROLE=aggregated|prefill|decode (resource `llm_d.role`, from the llm-d pod label `llm-d.ai/role`).
+           In P/D mode the decode pod receives the request with `x-prefiller-host-port` (llm-d routing
+           sidecar), asks the prefill pod to prefill it (max_tokens=1, do_remote_decode), waits for free KV
+           blocks (wait-for-KV), pulls the prompt's KV (NIXL-like; span `kv.transfer`, child of the decode
+           span; on failure it falls back to recomputing the prefill locally), then decodes. The prefill and
+           decode `llm_request` spans are both children of the gateway span.
   gateway  Envoy Inference Gateway + llm-d EPP: span `gateway.request`, child span `llm_d.route` with the
-           routing decision, an OTLP access log (log.source=gateway_access, header-contract fields), and
-           Gateway-API-Inference-Extension-style inference_pool_* / inference_objective_* metrics.
+           routing decision (decode + prefill pod in P/D), an OTLP access log (log.source=gateway_access,
+           header-contract fields, hashed `api_key_id`), and Gateway-API-Inference-Extension-style
+           inference_pool_* / inference_objective_* metrics. SCORER_WEIGHTS=prefix=..,queue=..,kv=..
   loadgen  an instrumented client app: span `gen_ai.chat` (CLIENT), identity headers, multi-turn sessions,
-           occasional client aborts.
+           a shared per-app system prompt, occasional client aborts. PROMPT_SHIFT=org:factor scales one
+           org's prompt length (playbook P1).
 
 Names marked "(verify)" in docs/telemetry-shapes.md are modeled on upstream docs and must be checked
 against the real components (M1 spike / M8).
@@ -34,7 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, web
-from opentelemetry import propagate
+from opentelemetry import propagate, trace
 from opentelemetry._logs import SeverityNumber
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
@@ -44,7 +52,10 @@ from sim.telemetry import Telemetry, k8s_resource, setup
 LATENCY_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0)
 ITL_BUCKETS = (0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.2, 0.5)
 MAX_CONTEXT_TOKENS = 12_000
-ENGINE_SCENARIOS = ("normal", "slow", "errors", "kv_pressure", "nccl_error")
+ENGINE_SCENARIOS = ("normal", "slow", "errors", "kv_pressure", "nccl_error", "kv_transfer_degraded")
+ROLES = ("aggregated", "prefill", "decode")
+SYSTEM_PROMPT_TOKENS = 200  # shared per-app system prompt (the EPP prefix index sees its blocks)
+PREFILLER_HEADER = "x-prefiller-host-port"  # llm-d routing sidecar: where the decode pod gets its prefill
 
 
 def _now_ns() -> int:
@@ -76,6 +87,10 @@ class EngineConfig:
     prefill_us_per_token: float = 120.0
     scenario: str = "normal"
     vendor: str = "nvidia"
+    role: str = "aggregated"
+    kv_bytes_per_token: int = 131_072  # layers x kv_heads x head_dim x 2 (K,V) x 2 bytes
+    kv_gbps: float = 40.0  # effective prefill->decode KV pull bandwidth (NVLink/xGMI on one node)
+    kv_fail_rate: float = 0.002
     pod: str = field(default_factory=lambda: os.environ.get("POD_NAME", socket.gethostname()))
 
     @classmethod
@@ -89,7 +104,22 @@ class EngineConfig:
             itl_ms=float(e.get("ITL_MS", "18")),
             scenario=e.get("SCENARIO", "normal"),
             vendor=e.get("GPU_VENDOR", "nvidia"),
+            role=e.get("ROLE", "aggregated"),
+            kv_bytes_per_token=int(e.get("KV_BYTES_PER_TOKEN", "131072")),
+            kv_gbps=float(e.get("KV_GBPS", "40")),
+            kv_fail_rate=float(e.get("KV_FAIL_RATE", "0.002")),
         )
+
+
+@dataclass
+class KvTransfer:
+    """One prefill->decode KV pull, as the decode pod's connector sees it."""
+
+    source_pod: str
+    nbytes: int
+    start_s: float  # offset from the decode request's start
+    seconds: float
+    failed: bool  # failed pulls fall back to recomputing the prefill on the decode pod
 
 
 @dataclass
@@ -105,19 +135,24 @@ class RequestResult:
     ttft_s: float
     e2e_s: float
     preempted: bool
+    kv: KvTransfer | None = None
 
 
 class Engine:
     def __init__(self, cfg: EngineConfig, tel: Telemetry, rng: random.Random | None = None) -> None:
         if cfg.scenario not in ENGINE_SCENARIOS:
             raise ValueError(f"unknown engine scenario {cfg.scenario!r}")
+        if cfg.role not in ROLES:
+            raise ValueError(f"unknown engine role {cfg.role!r}")
         self.cfg, self.tel = cfg, tel
         self.rng = rng or random.Random()
         self.running = 0
         self.waiting = 0
         self.kv_tokens = 0
         self.prefix_cache: OrderedDict[str, int] = OrderedDict()
+        self.prefix_cache_tokens = 0
         self.slots = asyncio.Semaphore(cfg.max_num_seqs)
+        self.kv_freed = asyncio.Condition()  # decode requests waiting for KV blocks wake on release
         self.registry = CollectorRegistry()
         lbl = ["model_name"]
         r = self.registry
@@ -142,6 +177,12 @@ class Engine:
         self.m_decode = Histogram(
             "vllm:request_decode_time_seconds", "Decode time", lbl, buckets=LATENCY_BUCKETS, registry=r
         )
+        # KV connector (NIXL) metrics, decode side: modeled on vLLM's NixlConnector stats (verify)
+        self.m_kv_xfer = Histogram(
+            "vllm:nixl_xfer_time_seconds", "KV transfer time", lbl, buckets=LATENCY_BUCKETS, registry=r
+        )
+        self.m_kv_bytes = Counter("vllm:nixl_bytes_transferred", "KV bytes transferred", lbl, registry=r)
+        self.m_kv_failed = Counter("vllm:nixl_num_failed_transfers", "Failed KV transfers", lbl, registry=r)
         self._update_gauges()
 
     # -- state ---------------------------------------------------------------------------------
@@ -157,6 +198,7 @@ class Engine:
         return {
             "pod": self.cfg.pod,
             "model": self.cfg.model,
+            "role": self.cfg.role,
             "running": self.running,
             "waiting": self.waiting,
             "kv_usage": round(self.kv_usage(), 4),
@@ -180,15 +222,61 @@ class Engine:
         return min(prefix_tokens, prompt_tokens) if hit else 0
 
     def _remember_prefix(self, prefix_id: str, tokens: int) -> None:
+        """Cached prefixes live in free KV blocks: a busy pod evicts them (LRU) as running requests need room."""
         if not prefix_id:
             return
+        self.prefix_cache_tokens += tokens - self.prefix_cache.get(prefix_id, 0)
         self.prefix_cache[prefix_id] = tokens
         self.prefix_cache.move_to_end(prefix_id)
-        while len(self.prefix_cache) > 2000:
-            self.prefix_cache.popitem(last=False)
+        budget = max(0, self.kv_capacity - self.kv_tokens)
+        while self.prefix_cache and (len(self.prefix_cache) > 2000 or self.prefix_cache_tokens > budget):
+            _, evicted = self.prefix_cache.popitem(last=False)
+            self.prefix_cache_tokens -= evicted
+
+    def _itl(self) -> float:
+        load = self.running / self.cfg.max_num_seqs
+        return self.cfg.itl_ms / 1000 * (1 + 0.8 * load) * (4.0 if self.cfg.scenario == "slow" else 1.0)
+
+    def _outcome(self, req: dict[str, Any], max_tokens: int) -> tuple[int, str, int]:
+        """(tokens out, finish reason, HTTP status) for one request."""
+        n_out = max(1, int(max_tokens * self.rng.uniform(0.3, 1.0)))
+        finish, status = ("length" if n_out == max_tokens else "stop"), 200
+        abort_at = req.get("abort_at_token")
+        if abort_at is not None and int(abort_at) < n_out:
+            n_out, finish, status = int(abort_at), "abort", 499
+        err_rate = {"errors": 0.10, "nccl_error": 0.02}.get(self.cfg.scenario, 0.002)
+        if self.rng.random() < err_rate:
+            n_out, finish, status = max(1, n_out // 3), "error", 500
+        return n_out, finish, status
+
+    def _observe(self, res: RequestResult) -> None:
+        m = self.cfg.model
+        self.m_prompt.labels(m).inc(res.tokens_in)
+        self.m_gen.labels(m).inc(res.tokens_out)
+        self.m_success.labels(m, res.finish_reason).inc()
+        self.m_ttft.labels(m).observe(res.ttft_s)
+        if res.tokens_out > 1:
+            self.m_itl.labels(m).observe(res.decode_s / (res.tokens_out - 1))
+        self.m_e2e.labels(m).observe(res.e2e_s)
+        self.m_queue.labels(m).observe(res.queue_s)
+        self.m_prefill.labels(m).observe(res.prefill_s)
+        self.m_decode.labels(m).observe(res.decode_s)
+        if res.kv is not None:
+            self.m_kv_xfer.labels(m).observe(res.kv.seconds)
+            self.m_kv_bytes.labels(m).inc(res.kv.nbytes)
+            if res.kv.failed:
+                self.m_kv_failed.labels(m).inc()
+
+    async def _release(self, reserve: int) -> None:
+        self.running -= 1
+        self.kv_tokens -= reserve
+        self._update_gauges()
+        async with self.kv_freed:
+            self.kv_freed.notify_all()
 
     # -- request -------------------------------------------------------------------------------
     async def run(self, req: dict[str, Any]) -> RequestResult:
+        """Aggregated request, or the prefill half of a P/D request (the caller sends max_tokens=1)."""
         cfg = self.cfg
         t0 = time.monotonic()
         prompt = int(req.get("prompt_tokens", 512))
@@ -210,28 +298,18 @@ class Engine:
             self._update_gauges()
             try:
                 prefill_s = (prompt - cached) * cfg.prefill_us_per_token / 1e6 * (1 + 0.5 * self.kv_usage())
+                if cfg.role == "prefill":  # compute-bound: concurrent prefills share the GPU
+                    prefill_s *= 1 + self.running / cfg.max_num_seqs
                 if preempted:
                     self.m_preempt.labels(cfg.model).inc()
                     prefill_s *= 1.8  # recompute after preemption
                 await asyncio.sleep(prefill_s)
                 t_first = time.monotonic()
-
-                load = self.running / cfg.max_num_seqs
-                itl = cfg.itl_ms / 1000 * (1 + 0.8 * load) * (4.0 if cfg.scenario == "slow" else 1.0)
-                n_out = max(1, int(max_tokens * self.rng.uniform(0.3, 1.0)))
-                finish = "length" if n_out == max_tokens else "stop"
-                status = 200
-                abort_at = req.get("abort_at_token")
-                if abort_at is not None and int(abort_at) < n_out:
-                    n_out, finish, status = int(abort_at), "abort", 499
-                err_rate = {"errors": 0.10, "nccl_error": 0.02}.get(cfg.scenario, 0.002)
-                if self.rng.random() < err_rate:
-                    n_out, finish, status = max(1, n_out // 3), "error", 500
+                itl = self._itl()
+                n_out, finish, status = self._outcome(req, max_tokens)
                 await asyncio.sleep(itl * (n_out - 1))
             finally:
-                self.running -= 1
-                self.kv_tokens -= reserve
-                self._update_gauges()
+                await self._release(reserve)
         t_end = time.monotonic()
         self._remember_prefix(prefix_id, prompt + n_out)
 
@@ -248,25 +326,83 @@ class Engine:
             e2e_s=t_end - t0,
             preempted=preempted,
         )
-        m = cfg.model
-        self.m_prompt.labels(m).inc(prompt)
-        self.m_gen.labels(m).inc(n_out)
-        self.m_success.labels(m, finish).inc()
-        self.m_ttft.labels(m).observe(res.ttft_s)
-        if n_out > 1:
-            self.m_itl.labels(m).observe(res.decode_s / (n_out - 1))
-        self.m_e2e.labels(m).observe(res.e2e_s)
-        self.m_queue.labels(m).observe(res.queue_s)
-        self.m_prefill.labels(m).observe(res.prefill_s)
-        self.m_decode.labels(m).observe(res.decode_s)
+        self._observe(res)
+        return res
+
+    async def run_decode(self, req: dict[str, Any], source_pod: str) -> RequestResult:
+        """Decode half of a P/D request: wait for KV blocks, pull the prompt's KV from the prefill pod, decode.
+
+        queue_s is the decode pod's wait-for-KV (slot + free blocks); prefill_s is non-zero only when the KV
+        pull failed and the prompt was recomputed locally; ttft_s counts from the decode pod's arrival."""
+        cfg = self.cfg
+        t0 = time.monotonic()
+        prompt = int(req.get("prompt_tokens", 512))
+        max_tokens = int(req.get("max_tokens", 256))
+        reserve = prompt + max_tokens
+        self.waiting += 1
+        self._update_gauges()
+        async with self.slots:
+            # wait-for-KV: the pulled prompt needs free blocks (an empty pod admits even an oversized prompt)
+            async with self.kv_freed:
+                await self.kv_freed.wait_for(lambda: not self.kv_tokens or self.kv_tokens + reserve <= self.kv_capacity)
+            self.waiting -= 1
+            t_sched = time.monotonic()
+            self.running += 1
+            self.kv_tokens += reserve
+            preempted = self.kv_usage() > 0.92
+            self._update_gauges()
+            try:
+                degraded = cfg.scenario == "kv_transfer_degraded"
+                nbytes = prompt * cfg.kv_bytes_per_token
+                gbps = cfg.kv_gbps * (0.05 if degraded else 1.0)
+                xfer_s = 0.0005 + nbytes / (gbps * 1e9) * self.rng.uniform(0.9, 1.3)
+                failed = self.rng.random() < (0.08 if degraded else cfg.kv_fail_rate)
+                if failed:
+                    xfer_s *= self.rng.uniform(0.3, 1.0)  # gave up part-way
+                await asyncio.sleep(xfer_s)
+                t_kv = time.monotonic()
+                kv = KvTransfer(source_pod, nbytes, t_sched - t0, xfer_s, failed)
+                recompute_s = 0.0
+                if failed:  # fallback: recompute the prefill on the decode pod
+                    recompute_s = prompt * cfg.prefill_us_per_token / 1e6 * (1 + 0.5 * self.kv_usage())
+                if preempted:
+                    self.m_preempt.labels(cfg.model).inc()
+                    recompute_s += prompt * cfg.prefill_us_per_token / 1e6
+                await asyncio.sleep(recompute_s)
+                t_ready = time.monotonic()
+                itl = self._itl()
+                await asyncio.sleep(itl)  # first decode step
+                t_first = time.monotonic()
+                n_out, finish, status = self._outcome(req, max_tokens)
+                await asyncio.sleep(itl * (n_out - 1))
+            finally:
+                await self._release(reserve)
+        t_end = time.monotonic()
+
+        res = RequestResult(
+            status=status,
+            finish_reason=finish,
+            tokens_in=prompt,
+            tokens_cached=0,  # the prefix cache is used on the prefill pod
+            tokens_out=n_out,
+            queue_s=t_sched - t0,
+            prefill_s=t_ready - t_kv,
+            decode_s=t_end - t_first,
+            ttft_s=t_first - t0,
+            e2e_s=t_end - t0,
+            preempted=preempted,
+            kv=kv,
+        )
+        self._observe(res)
         return res
 
     def emit_span(self, req: dict[str, Any], headers: dict[str, str], res: RequestResult, start_ns: int) -> None:
-        """One span per request, shaped like vLLM's OTLP request span."""
+        """One span per request, shaped like vLLM's OTLP request span (+ a `kv.transfer` child on decode)."""
         ctx = propagate.extract(headers)
         span = self.tel.tracer.start_span("llm_request", context=ctx, kind=SpanKind.SERVER, start_time=start_ns)
+        request_id = headers.get("x-request-id", "")
         attrs: dict[str, Any] = {
-            "gen_ai.request.id": headers.get("x-request-id", ""),
+            "gen_ai.request.id": request_id,
             "gen_ai.request.model": self.cfg.model,
             "gen_ai.response.model": self.cfg.model,
             "gen_ai.request.max_tokens": int(req.get("max_tokens", 0)),
@@ -285,6 +421,30 @@ class Engine:
             "llm.preempted": res.preempted,
         }
         span.set_attributes(attrs)
+        if res.kv is not None:
+            kv = res.kv
+            kv_start = start_ns + int(kv.start_s * 1e9)
+            kspan = self.tel.tracer.start_span(
+                "kv.transfer",
+                context=trace.set_span_in_context(span),
+                kind=SpanKind.CLIENT,
+                start_time=kv_start,
+            )
+            kspan.set_attributes(
+                {
+                    "gen_ai.request.id": request_id,
+                    "gen_ai.request.model": self.cfg.model,
+                    "llm_d.kv.connector": "nixl",
+                    "llm_d.kv.source_pod": kv.source_pod,
+                    "llm_d.kv.target_pod": self.cfg.pod,
+                    "llm_d.kv.bytes": kv.nbytes,
+                    "llm_d.kv.status": "failed" if kv.failed else "ok",
+                    "llm_d.kv.fallback": "recompute" if kv.failed else "",
+                }
+            )
+            if kv.failed:
+                kspan.set_status(Status(StatusCode.ERROR, "kv transfer failed"))
+            kspan.end(end_time=kv_start + int(kv.seconds * 1e9))
         if res.status >= 500:
             span.set_status(Status(StatusCode.ERROR, res.finish_reason))
         span.end(end_time=start_ns + int(res.e2e_s * 1e9))
@@ -301,6 +461,7 @@ class Engine:
                 "llm.tp": c.tp,
                 "llm.max_num_seqs": c.max_num_seqs,
                 "llm.dtype": "bfloat16",
+                "llm_d.role": c.role,
                 "gpu.vendor": c.vendor,
             },
             event_name="engine.started",
@@ -318,23 +479,61 @@ class Engine:
                 )
 
 
+SESSION = web.AppKey("session", ClientSession)
+
+
+async def _remote_prefill(
+    session: ClientSession, prefiller: str, body: dict[str, Any], headers: dict[str, str]
+) -> dict[str, Any] | None:
+    """Ask the prefill pod to prefill the prompt and keep its KV for us (llm-d sidecar + NIXL connector).
+
+    The incoming traceparent is forwarded unchanged, so the prefill span is a sibling of the decode span under
+    the gateway span. Returns the prefill response, or None (the decode pod then prefills locally)."""
+    pbody = {k: v for k, v in body.items() if k != "abort_at_token"}
+    pbody.update(max_tokens=1, kv_transfer_params={"do_remote_decode": True})
+    fwd = {k: v for k, v in headers.items() if k in ("traceparent", "tracestate", "x-request-id")}
+    fwd["content-type"] = "application/json"
+    try:
+        async with session.post(
+            f"http://{prefiller}/v1/completions", json=pbody, headers=fwd, timeout=ClientTimeout(total=120)
+        ) as r:
+            if r.status != 200:
+                return None
+            data: dict[str, Any] = await r.json()
+            return data
+    except Exception:
+        return None
+
+
 def engine_app(engine: Engine) -> web.Application:
     async def completions(request: web.Request) -> web.Response:
         start_ns = _now_ns()
         body = await request.json()
         headers = {k.lower(): v for k, v in request.headers.items()}
-        res = await engine.run(body)
+        prefiller = headers.get(PREFILLER_HEADER, "")
+        prefill = None
+        if engine.cfg.role == "decode" and prefiller:
+            prefill = await _remote_prefill(request.app[SESSION], prefiller, body, headers)
+        if prefill is not None:
+            start_ns = _now_ns()  # the decode request starts once the prefill pod is done
+            res = await engine.run_decode(body, str(prefill.get("kv_transfer_params", {}).get("remote_pod", "")))
+            cached = int(prefill.get("usage", {}).get("cached_tokens", 0))
+        else:
+            res = await engine.run(body)
+            cached = res.tokens_cached
         engine.emit_span(body, headers, res, start_ns)
-        payload = {
+        payload: dict[str, Any] = {
             "id": headers.get("x-request-id", ""),
             "model": engine.cfg.model,
             "finish_reason": res.finish_reason,
             "usage": {
                 "prompt_tokens": res.tokens_in,
                 "completion_tokens": res.tokens_out,
-                "cached_tokens": res.tokens_cached,
+                "cached_tokens": cached,
             },
         }
+        if (body.get("kv_transfer_params") or {}).get("do_remote_decode"):
+            payload["kv_transfer_params"] = {"remote_pod": engine.cfg.pod, "remote_engine_id": engine.cfg.pod}
         return web.json_response(payload, status=res.status)
 
     async def state(_: web.Request) -> web.Response:
@@ -345,7 +544,11 @@ def engine_app(engine: Engine) -> web.Application:
 
     async def on_start(app: web.Application) -> None:
         engine.startup_log()
+        app[SESSION] = ClientSession()
         app[BG_TASK] = asyncio.create_task(engine.nccl_errors())
+
+    async def on_cleanup(app: web.Application) -> None:
+        await app[SESSION].close()
 
     app = web.Application()
     app.add_routes(
@@ -357,6 +560,7 @@ def engine_app(engine: Engine) -> web.Application:
         ]
     )
     app.on_startup.append(on_start)
+    app.on_cleanup.append(on_cleanup)
     return app
 
 
@@ -372,6 +576,26 @@ def parse_api_keys(spec: str) -> dict[str, tuple[str, str]]:
     return out
 
 
+def hash_api_key(key: str) -> str:
+    """Stable, non-reversible API key id for the access log (the raw key is never logged)."""
+    return "key_" + hashlib.sha256(key.encode()).hexdigest()[:16] if key else ""
+
+
+def parse_weights(spec: str) -> tuple[float, float, float]:
+    """'prefix=0.4,queue=0.4,kv=0.2' -> (prefix, queue, kv); missing scorers keep their default."""
+    w = dict(zip(("prefix", "queue", "kv"), Scheduler.DEFAULT_WEIGHTS, strict=True))
+    for item in filter(None, (i.strip() for i in spec.split(","))):
+        name, _, val = item.partition("=")
+        if name not in w:
+            raise ValueError(f"unknown scorer {name!r}")
+        w[name] = float(val)
+    return w["prefix"], w["queue"], w["kv"]
+
+
+def format_weights(w: tuple[float, float, float]) -> str:
+    return f"prefix={w[0]:g},queue={w[1]:g},kv={w[2]:g}"
+
+
 @dataclass
 class Endpoint:
     address: str
@@ -383,6 +607,8 @@ class Endpoint:
     max_num_seqs: int = 64
     inflight: int = 0
     ready: bool = False
+    role: str = "aggregated"
+    failed_polls: int = 0
 
 
 @dataclass
@@ -397,42 +623,73 @@ class RouteDecision:
 
 
 class Scheduler:
-    """llm-d EPP-like scoring: prefix affinity + queue depth + KV usage."""
+    """llm-d EPP-like scoring: prefix affinity + queue depth + KV usage.
 
-    WEIGHTS = (0.4, 0.4, 0.2)
+    Pods are picked per role: the serving pod (aggregated or decode) and, for a decode pod, a prefill pod
+    (llm-d P/D scheduling profiles). The prefix index is per profile; a pod also scores for the app's shared
+    system prompt (its blocks lead every prompt), weighted by the prompt share those blocks represent."""
 
-    def __init__(self) -> None:
+    DEFAULT_WEIGHTS = (0.4, 0.4, 0.2)
+    SERVE_ROLES = ("aggregated", "decode")
+
+    def __init__(self, weights: tuple[float, float, float] = DEFAULT_WEIGHTS) -> None:
+        self.weights = weights
         self.endpoints: dict[str, Endpoint] = {}
-        self.prefix_index: OrderedDict[str, str] = OrderedDict()  # prefix_id -> endpoint address
+        self.prefix_index: OrderedDict[tuple[str, str], str] = OrderedDict()  # (profile, prefix) -> address
 
-    def pick(self, model: str, prefix_id: str) -> RouteDecision:
-        cands = [e for e in self.endpoints.values() if e.ready and e.model == model]
+    def _remember(self, key: tuple[str, str], address: str) -> None:
+        self.prefix_index[key] = address
+        self.prefix_index.move_to_end(key)
+        while len(self.prefix_index) > 20000:
+            self.prefix_index.popitem(last=False)
+
+    def pick(
+        self,
+        model: str,
+        prefix_id: str,
+        *,
+        roles: tuple[str, ...] = SERVE_ROLES,
+        system_prefix: str = "",
+        system_share: float = 0.0,
+    ) -> RouteDecision:
+        cands = [e for e in self.endpoints.values() if e.ready and e.model == model and e.role in roles]
         if not cands:
             return RouteDecision(None, 0, fallback_reason="no_endpoint_available")
-        owner = self.prefix_index.get(prefix_id) if prefix_id else None
+        profile = "prefill" if roles == ("prefill",) else "serve"
+        owner = self.prefix_index.get((profile, prefix_id)) if prefix_id else None
+        sys_owner = self.prefix_index.get((profile, "sys:" + system_prefix)) if system_prefix else None
+        wp, wq, wk = self.weights
         best: tuple[float, Endpoint, float, float, float] | None = None
         for e in cands:
-            sp = 1.0 if owner == e.address else 0.0
+            sp = 1.0 if owner == e.address else (system_share if sys_owner == e.address else 0.0)
             sq = 1.0 - min(1.0, (e.waiting + e.inflight) / e.max_num_seqs)
             sk = 1.0 - e.kv_usage
-            total = self.WEIGHTS[0] * sp + self.WEIGHTS[1] * sq + self.WEIGHTS[2] * sk
+            total = wp * sp + wq * sq + wk * sk
             if best is None or total > best[0]:
                 best = (total, e, sp, sq, sk)
         assert best is not None
         _, chosen, sp, sq, sk = best
         if prefix_id:
-            self.prefix_index[prefix_id] = chosen.address
-            self.prefix_index.move_to_end(prefix_id)
-            while len(self.prefix_index) > 20000:
-                self.prefix_index.popitem(last=False)
+            self._remember((profile, prefix_id), chosen.address)
+        if system_prefix:
+            self._remember((profile, "sys:" + system_prefix), chosen.address)
         reason = "" if owner is None or owner == chosen.address else "prefix_owner_overloaded"
-        return RouteDecision(chosen, len(cands), sp, sq, sk, prefix_hit_predicted=sp == 1.0, fallback_reason=reason)
+        return RouteDecision(
+            chosen, len(cands), sp, sq, sk, prefix_hit_predicted=owner == chosen.address, fallback_reason=reason
+        )
 
 
 class Gateway:
-    def __init__(self, tel: Telemetry, api_keys: dict[str, tuple[str, str]], discovery: str, pool: str) -> None:
+    def __init__(
+        self,
+        tel: Telemetry,
+        api_keys: dict[str, tuple[str, str]],
+        discovery: str,
+        pool: str,
+        weights: tuple[float, float, float] = Scheduler.DEFAULT_WEIGHTS,
+    ) -> None:
         self.tel, self.api_keys, self.discovery, self.pool = tel, api_keys, discovery, pool
-        self.scheduler = Scheduler()
+        self.scheduler = Scheduler(weights)
         self.session: ClientSession | None = None
         r = self.registry = CollectorRegistry()
         self.m_req = Counter("inference_objective_request", "Requests", ["model_name", "target_model_name"], registry=r)
@@ -489,8 +746,11 @@ class Gateway:
                         s["waiting"],
                     )
                     ep.kv_usage, ep.max_num_seqs, ep.ready = s["kv_usage"], s["max_num_seqs"], True
+                    ep.role, ep.failed_polls = s.get("role", "aggregated"), 0
                 except Exception:
-                    ep.ready = False
+                    # a busy engine can miss one poll; drop it from the pool only after repeated misses
+                    ep.failed_polls += 1
+                    ep.ready = ep.ready and ep.failed_polls < 3
             ready = [e for e in eps.values() if e.ready]
             self.m_pool_ready.labels(self.pool).set(len(ready))
             if ready:
@@ -523,19 +783,34 @@ class Gateway:
             )
             upstream_pod, status, resp_body = "", 401, b'{"error":"invalid api key"}'
             if key in self.api_keys:
+                prompt_tokens = max(1, int(body.get("prompt_tokens", 1)))
+                sys_prefix = str(body.get("system_prefix_id", ""))
+                sys_share = min(1.0, int(body.get("system_prefix_tokens", 0)) / prompt_tokens)
+                prefix_id = str(body.get("prefix_id", ""))
                 with self.tel.tracer.start_as_current_span("llm_d.route", kind=SpanKind.INTERNAL) as rspan:
                     t = time.perf_counter()
-                    d = self.scheduler.pick(model, str(body.get("prefix_id", "")))
+                    d = self.scheduler.pick(model, prefix_id, system_prefix=sys_prefix, system_share=sys_share)
+                    p: RouteDecision | None = None
+                    if d.endpoint is not None and d.endpoint.role == "decode":
+                        p = self.scheduler.pick(
+                            model, prefix_id, roles=("prefill",), system_prefix=sys_prefix, system_share=sys_share
+                        )
+                        if p.endpoint is None:
+                            d.fallback_reason = d.fallback_reason or "no_prefill_endpoint"
                     self.m_route.observe(time.perf_counter() - t)
+                    # in P/D the prefix cache that matters is the prefill pod's
+                    hint = p if p is not None and p.endpoint is not None else d
                     rspan.set_attributes(
                         {
                             "llm_d.candidates": d.candidates,
                             "llm_d.chosen_pod": d.endpoint.pod if d.endpoint else "",
-                            "llm_d.score.prefix": d.score_prefix,
+                            "llm_d.prefill_pod": p.endpoint.pod if p and p.endpoint else "",
+                            "llm_d.score.prefix": round(hint.score_prefix, 4),
                             "llm_d.score.queue": round(d.score_queue, 4),
                             "llm_d.score.kv": round(d.score_kv, 4),
-                            "llm_d.prefix_hit_predicted": d.prefix_hit_predicted,
+                            "llm_d.prefix_hit_predicted": hint.prefix_hit_predicted,
                             "llm_d.fallback_reason": d.fallback_reason,
+                            "llm_d.scorer_weights": format_weights(self.scheduler.weights),
                             "gen_ai.request.model": model,
                         }
                     )
@@ -544,9 +819,15 @@ class Gateway:
                     status, resp_body = 503, b'{"error":"no endpoint available"}'
                 else:
                     ep = d.endpoint
+                    pre = p.endpoint if p is not None else None
                     upstream_pod = ep.pod
-                    self.m_route_pick.labels(ep.pod, str(d.prefix_hit_predicted).lower()).inc()
+                    predicted = str(hint.prefix_hit_predicted).lower()
+                    self.m_route_pick.labels(ep.pod, predicted).inc()
                     out_headers = {"content-type": "application/json", "x-request-id": request_id}
+                    if pre is not None:
+                        self.m_route_pick.labels(pre.pod, predicted).inc()
+                        out_headers[PREFILLER_HEADER] = pre.address
+                        pre.inflight += 1
                     propagate.inject(out_headers)
                     ep.inflight += 1
                     try:
@@ -561,6 +842,8 @@ class Gateway:
                         status, resp_body = 502, b'{"error":"upstream failure"}'
                     finally:
                         ep.inflight -= 1
+                        if pre is not None:
+                            pre.inflight -= 1
             gspan.set_attribute("http.response.status_code", status)
             if status >= 500:
                 gspan.set_status(Status(StatusCode.ERROR))
@@ -582,6 +865,7 @@ class Gateway:
                     "request_id": request_id,
                     "org_id": org,
                     "app_id": app,
+                    "api_key_id": hash_api_key(key),
                     "user_id": headers.get("x-user-id", ""),
                     "session_id": headers.get("x-session-id", ""),
                     "model": model,
@@ -602,6 +886,13 @@ class Gateway:
 def gateway_app(gw: Gateway) -> web.Application:
     async def on_start(app: web.Application) -> None:
         gw.session = ClientSession()
+        weights = format_weights(gw.scheduler.weights)
+        # config marker: playbook P4 starts from "scorer weight changed"
+        gw.tel.log(
+            f"EPP scorer weights {weights}",
+            {"log.source": "gateway", "llm_d.scorer_weights": weights, "llm_d.pool": gw.pool},
+            event_name="epp.config",
+        )
         app[BG_TASK] = asyncio.create_task(gw.poll_endpoints())
 
     async def on_cleanup(_: web.Application) -> None:
@@ -634,6 +925,7 @@ class AppProfile:
     model: str
     prompt_mean: int
     max_tokens: int
+    org: str = ""
 
 
 @dataclass
@@ -645,8 +937,17 @@ class Session:
 
 
 class LoadGen:
-    def __init__(self, tel: Telemetry, target: str, rate: float, apps: list[AppProfile], seed: int = 0) -> None:
+    def __init__(
+        self,
+        tel: Telemetry,
+        target: str,
+        rate: float,
+        apps: list[AppProfile],
+        seed: int = 0,
+        prompt_shift: dict[str, float] | None = None,
+    ) -> None:
         self.tel, self.target, self.rate, self.apps = tel, target.rstrip("/"), rate, apps
+        self.prompt_shift = prompt_shift or {}  # org -> prompt-length factor (P1: RAG context bloat)
         self.rng = random.Random(seed)
         self.sessions: dict[str, list[Session]] = {a.app: [] for a in apps}
         self.sent = 0
@@ -666,13 +967,16 @@ class LoadGen:
     def build(self) -> tuple[AppProfile, Session, dict[str, Any]]:
         app = self.rng.choice(self.apps)
         s = self._session(app)
-        new_tokens = max(32, int(self.rng.lognormvariate(0, 0.6) * app.prompt_mean))
+        scale = self.prompt_shift.get(app.org, 1.0)
+        new_tokens = max(32, int(self.rng.lognormvariate(0, 0.6) * app.prompt_mean * scale))
         body: dict[str, Any] = {
             "model": app.model,
-            "prompt_tokens": s.context_tokens + new_tokens,
+            "prompt_tokens": SYSTEM_PROMPT_TOKENS + s.context_tokens + new_tokens,
             "max_tokens": app.max_tokens,
             "prefix_id": s.sid,
-            "prefix_tokens": s.context_tokens,
+            "prefix_tokens": SYSTEM_PROMPT_TOKENS + s.context_tokens if s.context_tokens else 0,
+            "system_prefix_id": app.app,
+            "system_prefix_tokens": SYSTEM_PROMPT_TOKENS,
             "temperature": self.rng.choice([0.0, 0.2, 0.7, 1.0]),
             "top_p": 1.0,
         }
@@ -749,8 +1053,17 @@ DEFAULT_APPS = (
 def parse_apps(spec: str) -> list[AppProfile]:
     out = []
     for item in filter(None, (s.strip() for s in spec.split(","))):
-        key, _org, app, model, prompt_mean, max_tokens = item.split(":")
-        out.append(AppProfile(key, app, model, int(prompt_mean), int(max_tokens)))
+        key, org, app, model, prompt_mean, max_tokens = item.split(":")
+        out.append(AppProfile(key, app, model, int(prompt_mean), int(max_tokens), org))
+    return out
+
+
+def parse_prompt_shift(spec: str) -> dict[str, float]:
+    """'acme:3,globex:1.5' -> {org: factor}"""
+    out: dict[str, float] = {}
+    for item in filter(None, (s.strip() for s in spec.split(","))):
+        org, _, factor = item.partition(":")
+        out[org] = float(factor)
     return out
 
 
@@ -776,7 +1089,12 @@ def main(argv: list[str] | None = None) -> None:
         tel = setup(
             k8s_resource(
                 "vllm",
-                {"llm.engine": "vllm", "llm.model": cfg.model, "llm.engine_version": cfg.engine_version},
+                {
+                    "llm.engine": "vllm",
+                    "llm.model": cfg.model,
+                    "llm.engine_version": cfg.engine_version,
+                    "llm_d.role": cfg.role,
+                },
             )
         )
         web.run_app(engine_app(Engine(cfg, tel)), port=a.port, access_log=None)
@@ -784,11 +1102,13 @@ def main(argv: list[str] | None = None) -> None:
         tel = setup(k8s_resource("inference-gateway"))
         keys = parse_api_keys(os.environ.get("API_KEYS", api_keys_from_apps(apps_spec)))
         discovery = os.environ.get("ENGINE_DISCOVERY", "localhost:8000")
-        gw = Gateway(tel, keys, discovery, os.environ.get("POOL_NAME", "llm-pool"))
+        weights = parse_weights(os.environ.get("SCORER_WEIGHTS", ""))
+        gw = Gateway(tel, keys, discovery, os.environ.get("POOL_NAME", "llm-pool"), weights)
         web.run_app(gateway_app(gw), port=a.port, access_log=None)
     else:
         tel = setup(k8s_resource("chat-frontend"))
-        lg = LoadGen(tel, a.target, a.rate, parse_apps(apps_spec))
+        shift = parse_prompt_shift(os.environ.get("PROMPT_SHIFT", ""))
+        lg = LoadGen(tel, a.target, a.rate, parse_apps(apps_spec), prompt_shift=shift)
         try:
             asyncio.run(lg.run(a.duration))
         finally:

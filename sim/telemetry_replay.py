@@ -2,8 +2,10 @@
 
 Each simulated request produces the same record set the real path produces (and the simulators emit):
   gateway.request span · llm_d.route span · vLLM llm_request span · gateway access log (log.source=gateway_access)
-with consistent trace/span IDs, so the full pipeline (agent -> Kafka -> gateway collector -> ClickHouse ->
-request join -> rollups) is exercised at a target request rate without running engines.
+and, for prefill/decode-disaggregated models, a second llm_request span (prefill pod, resource llm_d.role=prefill)
+plus a kv.transfer span on the decode pod, with consistent trace/span IDs, so the full pipeline
+(agent -> Kafka -> gateway collector -> ClickHouse -> request join -> rollups) is exercised at a target request rate
+without running engines.
 
 Every record carries org_id / resource `loadtest.run_id`, so a run can be counted exactly afterwards:
     SELECT count() FROM llm_requests FINAL WHERE org_id = 'loadtest-<run_id>'
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -32,7 +35,12 @@ from opentelemetry.proto.logs.v1 import logs_pb2
 from opentelemetry.proto.resource.v1 import resource_pb2
 from opentelemetry.proto.trace.v1 import trace_pb2
 
-MODELS = (("llama-3.1-70b-instruct", 3, 28.0), ("qwen2.5-7b-instruct", 3, 12.0))  # name, pods, itl_ms
+# name, pods per role, itl_ms, disaggregated (prefill + decode pods) or aggregated, KV bytes per token
+MODELS = (
+    ("llama-3.1-70b-instruct", 3, 28.0, True, 327_680),
+    ("qwen2.5-7b-instruct", 3, 12.0, False, 57_344),
+)
+KV_GBPS = 40.0
 APPS = ("chat-assistant", "code-review", "search-summarize", "support-bot")
 SPAN_SERVER, SPAN_INTERNAL = trace_pb2.Span.SPAN_KIND_SERVER, trace_pb2.Span.SPAN_KIND_INTERNAL
 
@@ -52,25 +60,24 @@ def kv(attrs: dict[str, Any]) -> list[common_pb2.KeyValue]:
     return out
 
 
-def resource(service: str, pod: str, run_id: str) -> resource_pb2.Resource:
-    return resource_pb2.Resource(
-        attributes=kv(
-            {
-                "service.name": service,
-                "k8s.pod.name": pod,
-                "k8s.namespace.name": "loadtest",
-                "k8s.node.name": "loadtest-node",
-                "loadtest.run_id": run_id,
-                "llm.engine": "vllm",
-            }
-        )
-    )
+def resource(service: str, pod: str, run_id: str, role: str = "") -> resource_pb2.Resource:
+    attrs = {
+        "service.name": service,
+        "k8s.pod.name": pod,
+        "k8s.namespace.name": "loadtest",
+        "k8s.node.name": "loadtest-node",
+        "loadtest.run_id": run_id,
+        "llm.engine": "vllm",
+    }
+    if role:
+        attrs["llm_d.role"] = role
+    return resource_pb2.Resource(attributes=kv(attrs))
 
 
 @dataclass
 class Batch:
     gw_spans: list[trace_pb2.Span] = field(default_factory=list)
-    eng_spans: dict[str, list[trace_pb2.Span]] = field(default_factory=dict)
+    eng_spans: dict[tuple[str, str], list[trace_pb2.Span]] = field(default_factory=dict)  # (pod, role)
     logs: list[logs_pb2.LogRecord] = field(default_factory=list)
     requests: int = 0
 
@@ -81,11 +88,43 @@ class Generator:
         self.org = f"loadtest-{run_id}"
         # IDs must be unique across runs (same-seed runs would reuse trace IDs and collapse in llm_requests)
         self.rng = random.Random(f"{run_id}-{seed}")
-        self.pods = [(m, f"replay-{m.split('-')[0]}-{i}", itl) for m, n, itl in MODELS for i in range(n)]
+        # (model, serving pod, role, prefill pods, itl_ms, kv bytes/token); P/D models route to the decode pod
+        self.pods: list[tuple[str, str, str, list[str], float, int]] = []
+        for m, n, itl, pd, kv_bpt in MODELS:
+            short = m.split("-")[0]
+            if pd:
+                prefill = [f"replay-{short}-prefill-{i}" for i in range(n)]
+                self.pods += [(m, f"replay-{short}-decode-{i}", "decode", prefill, itl, kv_bpt) for i in range(n)]
+            else:
+                self.pods += [(m, f"replay-{short}-{i}", "aggregated", [], itl, kv_bpt) for i in range(n)]
+
+    def _engine_span(
+        self,
+        trace_id: bytes,
+        span_id: bytes,
+        parent: bytes,
+        start: int,
+        end: int,
+        attrs: dict[str, Any],
+        error: bool = False,
+    ) -> trace_pb2.Span:
+        span = trace_pb2.Span(
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent,
+            name="llm_request",
+            kind=SPAN_SERVER,
+            start_time_unix_nano=start,
+            end_time_unix_nano=end,
+            attributes=kv(attrs),
+        )
+        if error:
+            span.status.code = trace_pb2.Status.STATUS_CODE_ERROR
+        return span
 
     def request(self, batch: Batch, now_ns: int) -> None:
         r = self.rng
-        model, pod, itl_ms = r.choice(self.pods)
+        model, pod, role, prefill_pods, itl_ms, kv_bpt = r.choice(self.pods)
         trace_id, gw_id, route_id, eng_id = r.randbytes(16), r.randbytes(8), r.randbytes(8), r.randbytes(8)
         request_id = str(uuid.UUID(bytes=r.randbytes(16), version=4))
         tin = int(r.lognormvariate(6.8, 0.7))
@@ -93,9 +132,23 @@ class Generator:
         tout = max(1, int(r.uniform(20, 400)))
         queue, prefill = r.expovariate(50), (tin - cached) * 120e-6
         decode = (tout - 1) * itl_ms / 1000 * r.uniform(0.9, 1.4)
-        e2e = queue + prefill + decode
         status = 499 if r.random() < 0.02 else (500 if r.random() < 0.003 else 200)
         finish = {499: "abort", 500: "error"}.get(status, "length" if r.random() < 0.1 else "stop")
+        prefill_pod = r.choice(prefill_pods) if prefill_pods else ""
+        if prefill_pod:  # P/D: prefill pod (queue + prefill), then decode pod (wait-for-KV, KV pull, decode)
+            wait = r.expovariate(200)
+            kv_bytes = tin * kv_bpt
+            xfer = 0.0005 + kv_bytes / (KV_GBPS * 1e9) * r.uniform(0.9, 1.3)
+            failed = r.random() < 0.002
+            recompute = tin * 120e-6 if failed else 0.0
+            first = itl_ms / 1000
+            p_e2e = queue + prefill
+            d_e2e = wait + xfer + recompute + first + decode
+        else:
+            wait = xfer = recompute = first = 0.0
+            kv_bytes, failed = 0, False
+            p_e2e, d_e2e = 0.0, queue + prefill + decode
+        e2e = p_e2e + d_e2e
         start = now_ns - int((e2e + 0.002) * 1e9)
 
         batch.gw_spans.append(
@@ -129,6 +182,7 @@ class Generator:
                     {
                         "gen_ai.request.model": model,
                         "llm_d.chosen_pod": pod,
+                        "llm_d.prefill_pod": prefill_pod,
                         "llm_d.candidates": 3,
                         "llm_d.score.prefix": 1.0 if cached else 0.0,
                         "llm_d.score.queue": 0.8,
@@ -139,35 +193,96 @@ class Generator:
                 ),
             )
         )
-        batch.eng_spans.setdefault(pod, []).append(
-            trace_pb2.Span(
+        common = {
+            "gen_ai.request.id": request_id,
+            "gen_ai.request.model": model,
+            "gen_ai.response.model": model,
+            "gen_ai.request.temperature": 0.7,
+            "gen_ai.request.top_p": 1.0,
+            "gen_ai.usage.prompt_tokens": tin,
+        }
+        eng_start = start + 200_000
+        if prefill_pod:
+            p_end = eng_start + int(p_e2e * 1e9)
+            batch.eng_spans.setdefault((prefill_pod, "prefill"), []).append(
+                self._engine_span(
+                    trace_id,
+                    r.randbytes(8),
+                    gw_id,
+                    eng_start,
+                    p_end,
+                    {
+                        **common,
+                        "gen_ai.request.max_tokens": 1,
+                        "gen_ai.usage.cached_tokens": cached,
+                        "gen_ai.usage.completion_tokens": 1,
+                        "gen_ai.response.finish_reasons": "length",
+                        "gen_ai.latency.time_in_queue": queue,
+                        "gen_ai.latency.time_to_first_token": queue + prefill,
+                        "gen_ai.latency.time_in_model_prefill": prefill,
+                        "gen_ai.latency.time_in_model_decode": 0.0,
+                        "gen_ai.latency.e2e": p_e2e,
+                        "llm.preempted": False,
+                    },
+                )
+            )
+            eng_start = p_end
+            kv_start = eng_start + int(wait * 1e9)
+            kspan = trace_pb2.Span(
                 trace_id=trace_id,
-                span_id=eng_id,
-                parent_span_id=gw_id,
-                name="llm_request",
-                kind=SPAN_SERVER,
-                start_time_unix_nano=start + 200_000,
-                end_time_unix_nano=now_ns - 1_000_000,
+                span_id=r.randbytes(8),
+                parent_span_id=eng_id,
+                name="kv.transfer",
+                kind=trace_pb2.Span.SPAN_KIND_CLIENT,
+                start_time_unix_nano=kv_start,
+                end_time_unix_nano=kv_start + int(xfer * 1e9),
                 attributes=kv(
                     {
                         "gen_ai.request.id": request_id,
                         "gen_ai.request.model": model,
-                        "gen_ai.response.model": model,
-                        "gen_ai.request.max_tokens": 512,
-                        "gen_ai.request.temperature": 0.7,
-                        "gen_ai.request.top_p": 1.0,
-                        "gen_ai.usage.prompt_tokens": tin,
-                        "gen_ai.usage.cached_tokens": cached,
-                        "gen_ai.usage.completion_tokens": tout,
-                        "gen_ai.response.finish_reasons": finish,
-                        "gen_ai.latency.time_in_queue": queue,
-                        "gen_ai.latency.time_to_first_token": queue + prefill,
-                        "gen_ai.latency.time_in_model_prefill": prefill,
-                        "gen_ai.latency.time_in_model_decode": decode,
-                        "gen_ai.latency.e2e": e2e,
-                        "llm.preempted": False,
+                        "llm_d.kv.connector": "nixl",
+                        "llm_d.kv.source_pod": prefill_pod,
+                        "llm_d.kv.target_pod": pod,
+                        "llm_d.kv.bytes": kv_bytes,
+                        "llm_d.kv.status": "failed" if failed else "ok",
+                        "llm_d.kv.fallback": "recompute" if failed else "",
                     }
                 ),
+            )
+            if failed:
+                kspan.status.code = trace_pb2.Status.STATUS_CODE_ERROR
+            batch.eng_spans.setdefault((pod, role), []).append(kspan)
+            serving = {
+                "gen_ai.usage.cached_tokens": 0,
+                "gen_ai.latency.time_in_queue": wait,
+                "gen_ai.latency.time_to_first_token": wait + xfer + recompute + first,
+                "gen_ai.latency.time_in_model_prefill": recompute,
+            }
+        else:
+            serving = {
+                "gen_ai.usage.cached_tokens": cached,
+                "gen_ai.latency.time_in_queue": queue,
+                "gen_ai.latency.time_to_first_token": queue + prefill,
+                "gen_ai.latency.time_in_model_prefill": prefill,
+            }
+        batch.eng_spans.setdefault((pod, role), []).append(
+            self._engine_span(
+                trace_id,
+                eng_id,
+                gw_id,
+                eng_start,
+                now_ns - 1_000_000,
+                {
+                    **common,
+                    **serving,
+                    "gen_ai.request.max_tokens": 512,
+                    "gen_ai.usage.completion_tokens": tout,
+                    "gen_ai.response.finish_reasons": finish,
+                    "gen_ai.latency.time_in_model_decode": decode,
+                    "gen_ai.latency.e2e": d_e2e,
+                    "llm.preempted": False,
+                },
+                error=status == 500,
             )
         )
         batch.logs.append(
@@ -184,7 +299,8 @@ class Generator:
                         "log.source": "gateway_access",
                         "request_id": request_id,
                         "org_id": self.org,
-                        "app_id": r.choice(APPS),
+                        "app_id": (app := r.choice(APPS)),
+                        "api_key_id": "key_" + hashlib.sha256(f"{self.org}-{app}".encode()).hexdigest()[:16],
                         "user_id": f"u{r.randrange(5000)}",
                         "session_id": f"s{r.randrange(20000)}",
                         "model": model,
@@ -214,9 +330,9 @@ class Generator:
         ]
         rs += [
             trace_pb2.ResourceSpans(
-                resource=resource("vllm", pod, self.run_id), scope_spans=[trace_pb2.ScopeSpans(spans=spans)]
+                resource=resource("vllm", pod, self.run_id, role), scope_spans=[trace_pb2.ScopeSpans(spans=spans)]
             )
-            for pod, spans in b.eng_spans.items()
+            for (pod, role), spans in b.eng_spans.items()
         ]
         logs = logs_service_pb2.ExportLogsServiceRequest(
             resource_logs=[

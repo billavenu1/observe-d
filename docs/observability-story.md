@@ -92,21 +92,24 @@ The consumer view is a first-class page, not just a search box.
 
 ## 5. Telemetry gaps
 
-Today's pipeline and simulator model **aggregated** serving. The P/D story needs the following.
+The data layer and the simulator now model **P/D** serving next to aggregated serving
+([0010_disaggregated.sql](../clickhouse/migrations/0010_disaggregated.sql)); dashboards do not use the new fields
+yet. ✓ = closed in the data layer (names marked modeled / sim-only in [telemetry-shapes.md](telemetry-shapes.md)
+still need checking on real llm-d + vLLM).
 
 | Gap | Today | Needed |
 |---|---|---|
-| Pod **role** (prefill / decode / aggregated) | no `role` column in `engine_requests` / `llm_requests` ([0003_engine.sql](../clickhouse/migrations/0003_engine.sql), [0004_requests.sql](../clickhouse/migrations/0004_requests.sql)) | `role` resource attribute and column; `role` label in Prometheus from the pod label |
-| Two engine spans per request | one `llm_request` span joined on `trace_id` | join the prefill and decode spans; keep `prefill_pod` and `decode_pod` |
-| **KV transfer** time, bytes, failures, fallback | absent (described in all_telemetry.md §D/§E only) | llm-d / NIXL connector metrics and a `kv.transfer` span |
-| **Decode wait-for-KV** time | absent | per request: queue time on the decode pod |
+| Pod **role** (prefill / decode / aggregated) | ✓ resource `llm_d.role` (pod label `llm-d.ai/role`) → `engine_requests.role`, `llm_requests.role`; Prometheus `role` label on engine series | dashboards: per-pool panels |
+| Two engine spans per request | ✓ join keeps the prefill and the serving (decode) span apart: `llm_requests.prefill_pod`, `decode_pod`, `has_prefill` | verify the sidecar forwards `traceparent` on real llm-d |
+| **KV transfer** time, bytes, failures, fallback | ✓ `kv.transfer` span → `kv_transfers` → `llm_requests.kv_transfer_us`, `kv_bytes`, `kv_fallback`; `vllm:nixl_*` metrics (sim) | real NIXL connector has no span: patch or log-derive; alerts and panels |
+| **Decode wait-for-KV** time | ✓ decode span queue time → `llm_requests.decode_wait_us` | verify vLLM's accounting of remote-KV waiting |
 | Per-request preemptions and cached tokens | `llm.preempted` and `gen_ai.usage.cached_tokens` are sim-only ([telemetry-shapes.md](telemetry-shapes.md)) | verify on real vLLM; fall back to per-pod counters |
 | Spec-decode acceptance; aborts by client | not wired | `vllm:spec_decode_*`; gateway 499 / abort flag |
-| **API key id** | org/app are derived from the key; the key is not stored ([header-contract.md](header-contract.md)) | hashed `api_key_id` on the gateway access log |
+| **API key id** | ✓ hashed `api_key_id` on the gateway access log → `gateway_requests`, `llm_requests` ([header-contract.md](header-contract.md)) | real gateway must compute the same hash; per-key rollups |
 | Effective-work breakdown | not computed | GPU-seconds split by bucket (§1) in `tokenomics_hourly` |
 | Headroom | [capacity.md](capacity.md) measures the telemetry pipeline, not serving | per-model SLO-break load from a serving load test |
 | Change events | k8s objects only | config / scorer / image changes as annotations on every time chart |
-| Simulator | [inference_stack.py](../sim/inference_stack.py) is aggregated only | P/D mode: prefill and decode engines, KV transfer, wait-for-KV, so every playbook is reproducible |
+| Simulator | ✓ P/D mode in [inference_stack.py](../sim/inference_stack.py) (`ROLE=prefill/decode`, KV pull with failure → recompute, wait-for-KV) and [telemetry_replay.py](../sim/telemetry_replay.py); the local stack runs every model P/D | P3 retry storm, P6, P9 scenarios |
 
 ## 6. Playbook readiness checklist
 
@@ -115,16 +118,16 @@ Today's pipeline and simulator model **aggregated** serving. The P/D story needs
 
 | Playbook | Signals | Dashboard panels | Alert | Sim scenario |
 |---|---|---|---|---|
-| P1 prefill saturated | ◐ prompt length by org exists; no `role` | ◐ TTFT yes, prefill pool no | ✓ `TTFTSLOBreach` | ✗ needs P/D mode + prompt-length shift |
-| P2 decode KV pressure | ◐ KV, preemptions per pod; no `role` | ✓ KV-cache usage, preemptions | ✓ `ITLSLOBreach`, `KVCacheSaturated`, `EnginePreempting` | ✓ `--engine kv_pressure` |
+| P1 prefill saturated | ✓ prompt length by org; `role`, prefill-pod `queue_us` | ◐ TTFT yes, prefill pool no | ✓ `TTFTSLOBreach` | ✓ `--playbook p1` (`--load prompt_shift`: acme prompts ×3) |
+| P2 decode KV pressure | ✓ KV, preemptions per pod; `role`; `decode_wait_us` | ✓ KV-cache usage, preemptions | ✓ `ITLSLOBreach`, `KVCacheSaturated`, `EnginePreempting` | ✓ `--engine kv_pressure` (decode pool) |
 | P3 busy but not useful | ◐ aborts via finish reason; recompute GPU time not computed | ◐ waste panel | ✓ `GoodputBelowTarget` | ◐ `kv_pressure`; no retry storm |
-| P4 routing skew | ◐ EPP scores modeled; prefix predicted vs actual | ✓ queue skew, predicted vs actual | ◐ `EngineQueueSkew`; no prefix-hit-drop alert | ✗ scorer-weight scenario |
-| P5 handoff tax | ✗ no KV-transfer telemetry | ✗ | ✗ | ◐ `--gpu link_errors` only |
+| P4 routing skew | ◐ EPP scores modeled; prefix predicted vs actual; weights on the route span + `epp.config` event (sim) | ✓ queue skew, predicted vs actual | ◐ `EngineQueueSkew`; no prefix-hit-drop alert | ✓ `--playbook p4` (`--routing scorer_skew`: prefix weight 0.9) |
+| P5 handoff tax | ✓ `kv_transfer_us`, `kv_bytes`, `kv_fallback` per request; `vllm:nixl_*` (modeled) | ✗ | ✗ | ✓ `--playbook p5` (`--engine kv_transfer_degraded` + `--gpu link_errors`) |
 | P6 CPU-starved engine | ✓ CPU throttling; tokens per iteration | ✓ CPU throttling panel | ✗ no CPU-throttling alert | ✗ |
 | P7 TP straggler | ◐ per-GPU throttling + GPU→pod map; no straggler metric | ◐ | ✓ `GPUThermalThrottling` | ◐ `--gpu throttle` (one GPU needed) |
 | P8 capacity / cold start | ✓ pending, `pod_startups`, idle GPU cost | ✓ | ◐ `GPUPodPending`; no idle-GPU alert | ◐ |
-| P9 key cost spike | ◐ org/app yes; no `api_key_id` | ◐ by org/app/model | ✓ `OrgCostSpike`, `RunawayGeneration` | ✗ |
-| P10 slow request | ◐ no KV-transfer / wait-for-KV stages | ✓ request explorer drill-down | ◐ `TracePropagationBroken` (pipeline health) | ✓ `--engine slow` |
+| P9 key cost spike | ✓ org/app; hashed `api_key_id` on `llm_requests` | ◐ by org/app/model | ✓ `OrgCostSpike`, `RunawayGeneration` | ✗ |
+| P10 slow request | ✓ prefill queue, prefill, wait-for-KV, KV transfer, decode stages on `llm_requests` | ◐ drill-down lacks the P/D stages | ◐ `TracePropagationBroken` (pipeline health) | ✓ `--engine slow` |
 
 ## 7. Page structure
 

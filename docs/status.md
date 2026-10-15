@@ -22,8 +22,8 @@ on the local stack (Podman + kind, simulated 8×MI300X node) and checked by a te
 
 | Suite | Count | What it proves |
 |---|---|---|
-| `pytest -m "not sql and not e2e"` | 37 | normalization (both vendors), generators, simulators, telemetry shapes, replay records |
-| `pytest -m sql` | 4 | request join (late spans, idempotent re-joins), SLO rollup, tokenomics math, Xid/RAS parsing |
+| `pytest -m "not sql and not e2e"` | 47 | normalization (both vendors), generators, simulators (aggregated and P/D), telemetry shapes, replay records |
+| `pytest -m sql` | 7 | request join (late spans, idempotent re-joins, P/D prefill + decode + KV transfer, hashed key id), SLO rollup, tokenomics math, Xid/RAS parsing |
 | `pytest -m e2e` | 109 | every panel query of the 8 dashboards returns data on the live stack |
 | `tools.loadtest` | see [capacity.md](capacity.md) | row count exact, join complete, no drops, drain time, part counts, outage recovery |
 

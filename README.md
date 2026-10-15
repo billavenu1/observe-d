@@ -5,6 +5,7 @@ vLLM → tokenomics → AI/LLM traceability. OTel Collector → Kafka → ClickH
 
 | Doc | What it is |
 |---|---|
+| [docs/observability-story.md](docs/observability-story.md) | The UI story for prefill/decode-disaggregated serving: levels, playbooks, gaps |
 | [MVP.md](MVP.md) | What is being built now (single GPU node, both vendors, 5k/7k req/s) |
 | [PLAN.md](PLAN.md) | Target architecture |
 | [all_telemetry.md](all_telemetry.md) | Full telemetry spec, layer by layer |
@@ -21,11 +22,17 @@ vLLM → tokenomics → AI/LLM traceability. OTel Collector → Kafka → ClickH
 ```
 kind "GPU node" (fake 8×MI300X or 8×H100)                    podman-compose backend
  ├─ fake GPU exporter (DCGM / AMD format, follows engine load)  ├─ Kafka (KRaft)  otlp_{traces,logs,metrics}
- ├─ simulated llm-d: gateway + EPP → vLLM engines → loadgen     ├─ OTel gateway collector → ClickHouse
+ ├─ simulated llm-d (P/D): gateway + EPP → decode ⇄ prefill pods ├─ OTel gateway collector → ClickHouse
  ├─ OTel agent (DaemonSet) + cluster collector (k8s events) ───▶└─ ClickHouse: raw OTel tables, gpu_samples,
  └─ kube-prometheus-stack (Prometheus, Grafana, KSM, alerts)       engine/routing/gateway staging, llm_requests,
-                                                                    rollups, tokenomics, k8s_events
+                                                                    kv_transfers, rollups, tokenomics, k8s_events
 ```
+
+The local stack serves every model **prefill/decode-disaggregated** (llm-d P/D): the EPP picks a decode pod and a
+prefill pod, the decode pod has the prompt prefilled remotely, waits for free KV blocks, pulls the KV
+(`kv.transfer` span; a failed pull falls back to recompute) and decodes. Pods carry `llm-d.ai/role`, which becomes
+the `llm_d.role` resource attribute and the Prometheus `role` label. Aggregated engines (`ROLE=aggregated`) are
+still supported by the simulator, the replay generator and the join.
 
 | Layer | Collected | Dashboard |
 |---|---|---|
@@ -35,7 +42,11 @@ kind "GPU node" (fake 8×MI300X or 8×H100)                    podman-compose ba
 | llm-d | pool KV/queue, routing decisions, predicted vs actual prefix hits, skew | 04 llm-d |
 | vLLM | TTFT/ITL/E2E/queue, KV cache, preemptions, tokens, finish reasons, SLO | 05 vLLM |
 | Tokenomics | cost/1M tokens, cost by org/app, J/token, idle GPU cost, cache savings, goodput | 06 Tokenomics |
-| Traceability | every request joined gateway ⋈ EPP ⋈ engine; drill-down to GPU + k8s state | 07 Request explorer |
+| Traceability | every request joined gateway ⋈ EPP ⋈ engine (prefill + decode spans, KV transfer); drill-down to GPU + k8s state | 07 Request explorer |
+
+`llm_requests` carries, per request: `role`, `prefill_pod`, `decode_pod`, prefill-pod queue and prefill time,
+`decode_wait_us` (wait-for-KV), `kv_transfer_us`, `kv_bytes`, `kv_fallback`, and the hashed `api_key_id`. The
+dashboards do not show the P/D fields yet (see the gaps in the story doc).
 
 Alerts: 21 Prometheus rules in `prometheus/rules/alerts.yaml` (GPU, k8s, gateway/llm-d, engine) and 5 Grafana
 rules on ClickHouse in `grafana/alerts/` (GPU fatal events from kernel logs incl. AMD RAS, NCCL/RCCL errors,
@@ -57,6 +68,13 @@ uv run python -m tools.dev up --vendor amd
 
 Then open Grafana at http://localhost:3300 (admin/admin) → folder **observe-d**. Data appears within ~2 minutes;
 tokenomics within ~5 minutes. Fault injection and other commands: [docs/runbook.md](docs/runbook.md).
+
+Reproduce a playbook from the story doc (P1 prompt-length shift for one org, P4 scorer-weight skew, P5 KV
+transfer degradation + link errors); `--playbook normal` resets:
+
+```bash
+uv run python -m tools.dev scenario --playbook p5
+```
 
 ## Tests
 
@@ -94,7 +112,7 @@ Docker instead of Podman: set `CONTAINER_CLI=docker` (used by the `e2e` GitHub w
 | `clickhouse/migrations/` | schema, MVs, refreshable views, cost dictionaries (`python -m tools.migrate`) |
 | `prometheus/rules/` | normalized recording rules (generated), k8s GPU rules, alerts |
 | `grafana/build.py` | dashboards as code → `grafana/dashboards/*.json` |
-| `sim/` | fake GPU exporter, simulated llm-d stack (gateway/EPP, vLLM engine, loadgen) |
+| `sim/` | fake GPU exporter, simulated llm-d stack (gateway/EPP, vLLM prefill/decode/aggregated engines, loadgen), OTLP replay generator |
 | `local/`, `deploy/helm/` | compose backend, kind config + manifests, kube-prometheus-stack values |
 | `tools/` | `dev.py` (local orchestration), `migrate.py`, `loadtest.py`, `render.py` (real-cluster manifests) |
 | `deploy/backend/` | Kafka (Strimzi) and ClickHouse (Altinity operator) for a real cluster |

@@ -28,8 +28,10 @@ def gateway_log(
     pod: str,
     code: int,  # type: ignore[no-untyped-def]
     ts: datetime = NOW,
+    api_key_id: str = "",
 ) -> None:
     attrs = {
+        "api_key_id": api_key_id,
         "log.source": "gateway_access",
         "request_id": f"req-{trace[:8]}",
         "org_id": org,
@@ -63,6 +65,10 @@ def engine_span(
     decode: float,
     finish: str = "stop",
     ts: datetime = NOW,
+    role: str = "",
+    span: str = "engspan",
+    queue: float = 0.01,
+    prefill: float | None = None,
 ) -> None:
     attrs = {
         "gen_ai.request.id": f"req-{trace[:8]}",
@@ -70,8 +76,8 @@ def engine_span(
         "gen_ai.usage.prompt_tokens": str(tin),
         "gen_ai.usage.cached_tokens": str(tcached),
         "gen_ai.usage.completion_tokens": str(tout),
-        "gen_ai.latency.time_in_queue": "0.01",
-        "gen_ai.latency.time_in_model_prefill": str(ttft - 0.01),
+        "gen_ai.latency.time_in_queue": str(queue),
+        "gen_ai.latency.time_in_model_prefill": str(ttft - queue if prefill is None else prefill),
         "gen_ai.latency.time_in_model_decode": str(decode),
         "gen_ai.latency.time_to_first_token": str(ttft),
         "gen_ai.latency.e2e": str(ttft + decode),
@@ -79,13 +85,15 @@ def engine_span(
         "gen_ai.request.temperature": "0.7",
     }
     res = {"k8s.pod.name": pod, "k8s.node.name": "node-a", "llm.engine": "vllm", "llm.engine_version": "test"}
+    if role:
+        res["llm_d.role"] = role
     client.insert(
         "otel_traces",
         [
             [
                 ts,
                 trace,
-                "engspan",
+                span,
                 "gwspan",
                 "llm_request",
                 "SPAN_KIND_SERVER",
@@ -288,3 +296,220 @@ def test_gpu_fatal_events_parse_nvidia_and_amd(ch) -> None:  # type: ignore[no-u
     assert ("amd", "gpu_reset", 0, "0000:1b:00.0", 1) in rows
     assert len(rows) == 3
     assert ch.query("SELECT count() FROM collective_errors WHERE node = 'fatal-node'").result_rows[0][0] == 1
+
+
+def kv_span(client, trace: str, *, src: str, dst: str, nbytes: int, seconds: float, failed: bool = False) -> None:  # type: ignore[no-untyped-def]
+    attrs = {
+        "gen_ai.request.model": "m1",
+        "llm_d.kv.connector": "nixl",
+        "llm_d.kv.source_pod": src,
+        "llm_d.kv.target_pod": dst,
+        "llm_d.kv.bytes": str(nbytes),
+        "llm_d.kv.status": "failed" if failed else "ok",
+        "llm_d.kv.fallback": "recompute" if failed else "",
+    }
+    client.insert(
+        "otel_traces",
+        [
+            [
+                NOW,
+                trace,
+                "kvspan",
+                "decspan",
+                "kv.transfer",
+                "SPAN_KIND_CLIENT",
+                "vllm",
+                {"k8s.pod.name": dst, "llm_d.role": "decode"},
+                attrs,
+                int(seconds * 1e9),
+                "STATUS_CODE_ERROR" if failed else "STATUS_CODE_UNSET",
+            ]
+        ],
+        column_names=[
+            "Timestamp",
+            "TraceId",
+            "SpanId",
+            "ParentSpanId",
+            "SpanName",
+            "SpanKind",
+            "ServiceName",
+            "ResourceAttributes",
+            "SpanAttributes",
+            "Duration",
+            "StatusCode",
+        ],
+    )
+
+
+def pd_request(ch, trace: str, *, failed: bool = False, with_prefill: bool = True) -> None:  # type: ignore[no-untyped-def]
+    """One disaggregated request: prefill-0 (queue 50 ms, prefill 100 ms) -> KV 20 ms -> decode-0."""
+    gateway_log(ch, trace, org="pd-org", app="chat", model="m1", pod="decode-0", code=200, api_key_id="key_abc")
+    if with_prefill:
+        prefill_span(ch, trace)
+    engine_span(
+        ch,
+        trace,
+        model="m1",
+        pod="decode-0",
+        role="decode",
+        span="decspan",
+        tin=1000,
+        tcached=0,
+        tout=101,
+        queue=0.02,  # wait-for-KV on the decode pod
+        prefill=0.12 if failed else 0.0,  # recompute after a failed pull
+        ttft=0.05,
+        decode=2.0,
+    )
+    kv_span(ch, trace, src="prefill-0", dst="decode-0", nbytes=327_680_000, seconds=0.02, failed=failed)
+    route_span(ch, trace, pod="decode-0", predicted=True)
+
+
+def prefill_span(ch, trace: str) -> None:  # type: ignore[no-untyped-def]
+    engine_span(
+        ch,
+        trace,
+        model="m1",
+        pod="prefill-0",
+        role="prefill",
+        span="prespan",
+        tin=1000,
+        tcached=600,
+        tout=1,
+        queue=0.05,
+        prefill=0.1,
+        ttft=0.15,
+        decode=0.0,
+        finish="length",
+    )
+
+
+def test_pd_join_two_engine_spans_and_kv_transfer(ch) -> None:  # type: ignore[no-untyped-def]
+    pd, fallback, agg = tid(), tid(), tid()
+    pd_request(ch, pd)
+    pd_request(ch, fallback, failed=True)
+    gateway_log(ch, agg, org="pd-org", app="chat", model="m1", pod="agg-0", code=200)
+    engine_span(ch, agg, model="m1", pod="agg-0", tin=500, tcached=100, tout=11, ttft=0.2, decode=0.5)
+    refresh(ch, "llm_requests_refresh")
+
+    rows = {r["trace_id"]: r for r in final_rows(ch, f"trace_id IN ('{pd}', '{fallback}', '{agg}')")}
+    assert len(rows) == 3
+    r = rows[pd]
+    assert (r["role"], r["pod"], r["prefill_pod"], r["decode_pod"]) == ("decode", "decode-0", "prefill-0", "decode-0")
+    assert (r["has_engine"], r["has_prefill"], r["has_kv"], r["has_route"]) == (1, 1, 1, 1)
+    assert (r["tokens_in"], r["tokens_cached"], r["tokens_out"]) == (1000, 600, 101)  # cache hit on the prefill pod
+    assert r["prefix_hit_actual"] == 1 and r["api_key_id"] == "key_abc" and r["status"] == "ok"
+    assert r["queue_us"] == 50_000  # prefill-pod queue
+    assert r["decode_wait_us"] == 20_000  # decode-pod wait-for-KV
+    assert r["prefill_us"] == 100_000
+    assert (r["kv_transfer_us"], r["kv_bytes"], r["kv_fallback"]) == (20_000, 327_680_000, 0)
+    assert r["ttft_us"] == 200_000  # 150 ms on the prefill pod + 50 ms on the decode pod
+    assert abs(r["e2e_us"] - 2_200_000) <= 1 and r["tpot_us"] == 20_000  # float seconds -> whole us
+
+    f = rows[fallback]
+    assert f["kv_fallback"] == 1 and f["prefill_us"] == 100_000 + 120_000  # prefill pod + recompute on decode
+
+    a = rows[agg]
+    assert (a["role"], a["pod"], a["prefill_pod"], a["decode_pod"]) == ("aggregated", "agg-0", "", "")
+    assert (a["has_prefill"], a["has_kv"], a["decode_wait_us"], a["kv_transfer_us"], a["kv_fallback"]) == (
+        0,
+        0,
+        0,
+        0,
+        0,
+    )
+    assert (a["tokens_cached"], a["queue_us"], a["ttft_us"]) == (100, 10_000, 200_000)
+
+    kv = ch.query(
+        f"SELECT source_pod, target_pod, bytes, transfer_us, status, fallback FROM kv_transfers "
+        f"WHERE trace_id = '{fallback}'"
+    ).result_rows
+    assert kv == [("prefill-0", "decode-0", 327_680_000, 20_000, "failed", "recompute")]
+    roles = dict(ch.query(f"SELECT pod, role FROM engine_requests WHERE trace_id = '{pd}'").result_rows)
+    assert roles == {"prefill-0": "prefill", "decode-0": "decode"}
+
+
+def test_pd_late_prefill_span_replaces_incomplete_row(ch) -> None:  # type: ignore[no-untyped-def]
+    late = tid()
+    pd_request(ch, late, with_prefill=False)
+    refresh(ch, "llm_requests_refresh")
+    (r,) = final_rows(ch, f"trace_id = '{late}'")
+    assert (r["has_engine"], r["has_prefill"], r["prefill_pod"], r["role"]) == (1, 0, "", "decode")
+    prefill_span(ch, late)
+    refresh(ch, "llm_requests_refresh")
+    (r,) = final_rows(ch, f"trace_id = '{late}'")
+    assert (r["has_prefill"], r["prefill_pod"], r["tokens_cached"], r["ttft_us"]) == (1, "prefill-0", 600, 200_000)
+
+
+def test_gateway_requests_keep_hashed_api_key(ch) -> None:  # type: ignore[no-untyped-def]
+    t = tid()
+    gateway_log(ch, t, org="acme", app="chat", model="m1", pod="p1", code=200, api_key_id="key_0123456789abcdef")
+    rows = ch.query(f"SELECT api_key_id FROM gateway_requests WHERE trace_id = '{t}'").result_rows
+    assert rows == [("key_0123456789abcdef",)]
+
+
+def test_tokenomics_charges_prefill_pods_in_pd(ch) -> None:  # type: ignore[no-untyped-def]
+    """0011: a prefill pod's GPU time goes to the orgs it prefilled for (by uncached prompt tokens), not '(idle)'."""
+    model, pre, dec, minutes = "llama-3.1-70b-instruct", "pd-tok-pre", "pd-tok-dec", 5
+    base = NOW.replace(second=0, microsecond=0) - timedelta(minutes=minutes - 1)
+    rows = []
+    for gpu, owner in (("g2", pre), ("g3", dec)):
+        attrs = {
+            "vendor": "amd",
+            "node": "node-a",
+            "gpu_uuid": f"uuid-pd-{gpu}",
+            "gpu_index": gpu[1:],
+            "gpu_model": "AMD Instinct MI300X",
+            "pod": owner,
+            "namespace": "llm",
+        }
+        rows += [[base + timedelta(minutes=m), "gpu.power_watts", attrs, 500.0] for m in range(minutes)]
+    ch.insert("otel_metrics_gauge", rows, column_names=["TimeUnix", "MetricName", "Attributes", "Value"])
+
+    for org, cached, tout in (("pd-x", 0, 101), ("pd-y", 500, 301)):  # prefill work 1000:500, decode 101:301
+        t = tid()
+        gateway_log(ch, t, org=org, app="app", model=model, pod=dec, code=200)
+        engine_span(
+            ch,
+            t,
+            model=model,
+            pod=pre,
+            role="prefill",
+            span="prespan",
+            tin=1000,
+            tcached=cached,
+            tout=1,
+            ttft=0.2,
+            decode=0.0,
+        )
+        engine_span(
+            ch,
+            t,
+            model=model,
+            pod=dec,
+            role="decode",
+            span="decspan",
+            tin=1000,
+            tcached=0,
+            tout=tout,
+            queue=0.01,
+            prefill=0.0,
+            ttft=0.05,
+            decode=1.0,
+        )
+    refresh(ch, "llm_requests_refresh", "tokenomics_hourly_refresh")
+
+    res = {
+        (r[0], r[1]): r[2:]
+        for r in ch.query(
+            "SELECT pod, org_id, sum(gpu_seconds), sum(requests), sum(tokens_out) FROM tokenomics_hourly FINAL "
+            f"WHERE pod IN ('{pre}', '{dec}') GROUP BY pod, org_id"
+        ).result_rows
+    }
+    gpu_s = minutes * 60
+    assert set(res) == {(pre, "pd-x"), (pre, "pd-y"), (dec, "pd-x"), (dec, "pd-y")}  # nothing '(idle)'
+    assert res[(pre, "pd-x")][0] == pytest.approx(gpu_s * 1000 / 1500, rel=0.01)
+    assert res[(pre, "pd-y")][0] == pytest.approx(gpu_s * 500 / 1500, rel=0.01)
+    assert res[(dec, "pd-x")][0] == pytest.approx(gpu_s * 101 / 402, rel=0.01)
+    # requests and tokens count once, on the serving (decode) pod
+    assert res[(pre, "pd-x")][1:] == (0, 0) and res[(dec, "pd-x")][1:] == (1, 101)

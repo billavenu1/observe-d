@@ -8,7 +8,8 @@
 | Start as NVIDIA node | `uv run python -m tools.dev up --vendor nvidia --skip-monitoring` |
 | Rebuild simulator image | add `--rebuild` |
 | Change load | `uv run python -m tools.dev rate 50` |
-| Inject engine fault (llama-70b) | `uv run python -m tools.dev scenario --engine slow\|errors\|kv_pressure\|nccl_error\|normal` |
+| Inject engine fault (llama-70b decode pool by default) | `uv run python -m tools.dev scenario --engine slow\|errors\|kv_pressure\|nccl_error\|kv_transfer_degraded\|normal [--pool decode\|prefill\|both] [--model llama-70b\|qwen-7b]` |
+| Reproduce a playbook | `uv run python -m tools.dev scenario --playbook p1\|p4\|p5\|normal` (P1 `--load prompt_shift`, P4 `--routing scorer_skew`, P5 KV degradation + link errors) |
 | Inject GPU fault | `uv run python -m tools.dev scenario --gpu throttle\|xid\|ecc\|link_errors\|load` |
 | Re-publish dashboards | `uv run python -m tools.dev dashboards` |
 | Status / URLs | `uv run python -m tools.dev status` |

@@ -8,6 +8,7 @@ request and one tenant — agree them with the gateway owner before anything els
 |---|---|---|---|
 | `traceparent` | yes | client, else the gateway creates it | W3C Trace Context. Must be forwarded to EPP and vLLM unchanged. Join key for `llm_requests`. |
 | `x-request-id` | yes | client, else Envoy generates it | Human-friendly lookup key; fallback join key if vLLM does not propagate `traceparent`. |
+| `authorization` (API key) | yes | client | Never logged. The gateway logs `api_key_id` = `key_` + first 16 hex chars of SHA-256(key) so cost and abuse can be attributed per key (playbook P9). |
 | `x-org-id` | yes | **gateway, derived from the API key** | Never trusted from the client: the gateway overwrites any client value. |
 | `x-app-id` | yes | **gateway, derived from the API key** | Same rule as `x-org-id`. |
 | `x-user-id` | optional | client | Pseudonymized (hash / opaque ID). Never an email or name. |
@@ -21,12 +22,15 @@ request and one tenant — agree them with the gateway owner before anything els
 | `x-request-id` | `request_id` attribute | attribute | `gen_ai.request.id` (verify) | `request_id` |
 | `x-org-id` | attribute | — | — | `org_id` |
 | `x-app-id` | attribute | — | — | `app_id` |
+| API key (hashed) | `api_key_id` attribute | — | — | `api_key_id` (also `gateway_requests.api_key_id`) |
 | `x-user-id` | attribute | — | — | `user_id` |
 | `x-session-id` | attribute | — | — | `session_id` |
 
 ## Rules
 
-- High-cardinality IDs (`x-request-id`, `x-user-id`, `x-session-id`, trace IDs) are **never** used as metric
+- In P/D serving the llm-d routing sidecar on the decode pod must forward `traceparent` and `x-request-id`
+  unchanged to the prefill pod, so both engine spans join the gateway's trace.
+- High-cardinality IDs (`x-request-id`, `x-user-id`, `x-session-id`, `api_key_id`, trace IDs) are **never** used as metric
   labels — only on logs, spans and `llm_requests` rows. The collector drops them from metrics.
 - Missing `x-org-id` / `x-app-id` is recorded as `unknown`, never dropped, and counted on the traceability
   dashboard so broken gateway config is visible.

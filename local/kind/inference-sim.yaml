@@ -1,7 +1,9 @@
 # Simulated GPU node workload: fake GPU exporter + simulated llm-d stack (gateway/EPP, vLLM engines, loadgen).
 # Placeholders (__GPU_VENDOR__, __GPU_RESOURCE__, ...) are filled in by tools/dev.py.
 #
-# GPU layout on the 8-GPU node:  llama-3.1-70b x1 (TP=4)  +  qwen2.5-7b x2 (TP=1)  ->  6 allocated, 2 idle.
+# Prefill/decode-disaggregated (llm-d P/D): every model has a prefill and a decode pod (pod label llm-d.ai/role).
+# GPU layout on the 8-GPU node:  llama-3.1-70b prefill x1 (TP=2) + decode x1 (TP=2)
+#                              + qwen2.5-7b prefill x1 (TP=1) + decode x1 (TP=1)  ->  6 allocated, 2 idle.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -68,29 +70,30 @@ spec:
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: vllm-llama-70b, namespace: llm}
+metadata: {name: vllm-llama-70b-prefill, namespace: llm}
 spec:
   strategy: {type: Recreate}   # GPU pods: a surge pod would not fit on the node
   replicas: 1
-  selector: {matchLabels: {app.kubernetes.io/name: vllm-llama-70b}}
+  selector: {matchLabels: {app.kubernetes.io/name: vllm-llama-70b-prefill}}
   template:
     metadata:
-      labels: {app.kubernetes.io/name: vllm-llama-70b, observe-d.io/role: engine}
+      labels: {app.kubernetes.io/name: vllm-llama-70b-prefill, observe-d.io/role: engine, llm-d.ai/role: prefill}
       annotations: {observe-d.io/scrape: engine, observe-d.io/port: "8000"}
     spec:
       containers:
-        -
-          name: vllm
+        - name: vllm
           image: localhost/observe-d-sim:dev
           imagePullPolicy: Never
           args: [sim.inference_stack, engine, --port, "8000"]
           envFrom: [{configMapRef: {name: sim-common}}]
           env:
             - {name: MODEL, value: llama-3.1-70b-instruct}
-            - {name: TP, value: "4"}
-            - {name: MAX_NUM_SEQS, value: "128"}
+            - {name: ROLE, value: prefill}
+            - {name: TP, value: "2"}
+            - {name: MAX_NUM_SEQS, value: "16"}
             - {name: ITL_MS, value: "28"}
-            - {name: KV_CAPACITY_TOKENS, value: "400000"}
+            - {name: KV_CAPACITY_TOKENS, value: "200000"}
+            - {name: KV_BYTES_PER_TOKEN, value: "327680"}
             - {name: SCENARIO, value: normal}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
@@ -102,18 +105,58 @@ spec:
           readinessProbe: {httpGet: {path: /health, port: 8000}}
           resources:
             requests: {cpu: 50m, memory: 64Mi}
-            limits: {memory: 192Mi, __GPU_RESOURCE__: 4}
+            limits: {memory: 192Mi, __GPU_RESOURCE__: 2}
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: vllm-qwen-7b, namespace: llm}
+metadata: {name: vllm-llama-70b-decode, namespace: llm}
 spec:
   strategy: {type: Recreate}   # GPU pods: a surge pod would not fit on the node
-  replicas: 2
-  selector: {matchLabels: {app.kubernetes.io/name: vllm-qwen-7b}}
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: vllm-llama-70b-decode}}
   template:
     metadata:
-      labels: {app.kubernetes.io/name: vllm-qwen-7b, observe-d.io/role: engine}
+      labels: {app.kubernetes.io/name: vllm-llama-70b-decode, observe-d.io/role: engine, llm-d.ai/role: decode}
+      annotations: {observe-d.io/scrape: engine, observe-d.io/port: "8000"}
+    spec:
+      containers:
+        - name: vllm
+          image: localhost/observe-d-sim:dev
+          imagePullPolicy: Never
+          args: [sim.inference_stack, engine, --port, "8000"]
+          envFrom: [{configMapRef: {name: sim-common}}]
+          env:
+            - {name: MODEL, value: llama-3.1-70b-instruct}
+            - {name: ROLE, value: decode}
+            - {name: TP, value: "2"}
+            - {name: MAX_NUM_SEQS, value: "128"}
+            - {name: ITL_MS, value: "28"}
+            # 2 x 192 GB HBM minus 140 GB of weights, at 320 KiB/token
+            - {name: KV_CAPACITY_TOKENS, value: "760000"}
+            - {name: KV_BYTES_PER_TOKEN, value: "327680"}
+            - {name: SCENARIO, value: normal}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe: {httpGet: {path: /health, port: 8000}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi, __GPU_RESOURCE__: 2}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: vllm-qwen-7b-prefill, namespace: llm}
+spec:
+  strategy: {type: Recreate}   # GPU pods: a surge pod would not fit on the node
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: vllm-qwen-7b-prefill}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: vllm-qwen-7b-prefill, observe-d.io/role: engine, llm-d.ai/role: prefill}
       annotations: {observe-d.io/scrape: engine, observe-d.io/port: "8000"}
     spec:
       containers:
@@ -124,10 +167,51 @@ spec:
           envFrom: [{configMapRef: {name: sim-common}}]
           env:
             - {name: MODEL, value: qwen2.5-7b-instruct}
+            - {name: ROLE, value: prefill}
+            - {name: TP, value: "1"}
+            - {name: MAX_NUM_SEQS, value: "16"}
+            - {name: ITL_MS, value: "12"}
+            - {name: KV_CAPACITY_TOKENS, value: "150000"}
+            - {name: KV_BYTES_PER_TOKEN, value: "57344"}
+            - {name: SCENARIO, value: normal}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          ports: [{name: http, containerPort: 8000}]
+          readinessProbe: {httpGet: {path: /health, port: 8000}}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 192Mi, __GPU_RESOURCE__: 1}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: vllm-qwen-7b-decode, namespace: llm}
+spec:
+  strategy: {type: Recreate}   # GPU pods: a surge pod would not fit on the node
+  replicas: 1
+  selector: {matchLabels: {app.kubernetes.io/name: vllm-qwen-7b-decode}}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: vllm-qwen-7b-decode, observe-d.io/role: engine, llm-d.ai/role: decode}
+      annotations: {observe-d.io/scrape: engine, observe-d.io/port: "8000"}
+    spec:
+      containers:
+        - name: vllm
+          image: localhost/observe-d-sim:dev
+          imagePullPolicy: Never
+          args: [sim.inference_stack, engine, --port, "8000"]
+          envFrom: [{configMapRef: {name: sim-common}}]
+          env:
+            - {name: MODEL, value: qwen2.5-7b-instruct}
+            - {name: ROLE, value: decode}
             - {name: TP, value: "1"}
             - {name: MAX_NUM_SEQS, value: "64"}
             - {name: ITL_MS, value: "12"}
             - {name: KV_CAPACITY_TOKENS, value: "150000"}
+            - {name: KV_BYTES_PER_TOKEN, value: "57344"}
             - {name: SCENARIO, value: normal}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
@@ -167,6 +251,7 @@ spec:
           env:
             - {name: ENGINE_DISCOVERY, value: "vllm-engines.llm.svc.cluster.local:8000"}
             - {name: POOL_NAME, value: llm-pool}
+            - {name: SCORER_WEIGHTS, value: "prefix=0.4,queue=0.4,kv=0.2"}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_NAMESPACE
@@ -198,6 +283,7 @@ spec:
           env:
             - {name: TARGET, value: "http://inference-gateway.llm.svc.cluster.local:8080"}
             - {name: RATE, value: "__LOAD_RATE__"}
+            - {name: PROMPT_SHIFT, value: ""}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_NAMESPACE
@@ -227,7 +313,10 @@ metadata: {name: llm-engines, namespace: llm}
 spec:
   selector: {matchLabels: {observe-d.io/role: engine}}
   podMetricsEndpoints:
-    - {port: http, interval: 10s}
+    - port: http
+      interval: 10s
+      relabelings:   # P/D pool of the pod (llm-d.ai/role); aggregated pods have no label
+        - {sourceLabels: [__meta_kubernetes_pod_label_llm_d_ai_role], targetLabel: role, regex: "(.+)"}
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor

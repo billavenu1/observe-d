@@ -2,8 +2,12 @@
 
     uv run python -m tools.dev up [--vendor amd|nvidia] [--rate 20] [--rebuild]
     uv run python -m tools.dev status
-    uv run python -m tools.dev scenario --engine slow|errors|kv_pressure|nccl_error|normal
+    uv run python -m tools.dev scenario --engine slow|errors|kv_pressure|nccl_error|kv_transfer_degraded|normal
+                                       [--pool decode|prefill|both] [--model llama|qwen]
     uv run python -m tools.dev scenario --gpu load|throttle|xid|ecc|link_errors
+    uv run python -m tools.dev scenario --load prompt_shift|normal        # P1: one org's prompts x3
+    uv run python -m tools.dev scenario --routing scorer_skew|normal      # P4: prefix scorer weight raised
+    uv run python -m tools.dev scenario --playbook p1|p4|p5|normal        # the scenario(s) behind a playbook
     uv run python -m tools.dev rate 50
     uv run python -m tools.dev down [--keep-cluster]
 
@@ -35,6 +39,19 @@ COMPOSE = ["podman-compose"] if CLI == "podman" else ["docker", "compose"]
 SIM_IMAGE = "localhost/observe-d-sim:dev"
 TOPICS = ("otlp_logs", "otlp_metrics", "otlp_traces")
 GPU_RESOURCE = {"amd": "amd.com/gpu", "nvidia": "nvidia.com/gpu"}
+ENGINE_MODELS = ("llama-70b", "qwen-7b")
+ENGINE_DEPLOYMENTS = tuple(f"vllm-{m}-{role}" for m in ENGINE_MODELS for role in ("prefill", "decode"))
+ENGINE_SCENARIOS = ("normal", "slow", "errors", "kv_pressure", "nccl_error", "kv_transfer_degraded")
+PROMPT_SHIFT = "acme:3"  # P1: acme's prompts triple (RAG context bloat) -> prefill pool saturates
+SKEWED_WEIGHTS = "prefix=0.9,queue=0.05,kv=0.05"  # P4: prefix affinity dominates -> one decode pod runs hot
+DEFAULT_WEIGHTS = "prefix=0.4,queue=0.4,kv=0.2"
+# playbook -> scenario flags (docs/observability-story.md §3)
+PLAYBOOKS: dict[str, dict[str, str]] = {
+    "p1": {"load": "prompt_shift"},
+    "p4": {"routing": "scorer_skew"},
+    "p5": {"engine": "kv_transfer_degraded", "gpu": "link_errors"},
+    "normal": {"engine": "normal", "gpu": "load", "load": "normal", "routing": "normal"},
+}
 
 
 def versions() -> dict:  # type: ignore[type-arg]
@@ -272,8 +289,7 @@ def workloads_up(vendor: str, rate: float) -> None:
     apply_text(render("local/kind/inference-sim.yaml"))
     for ns, name in (
         ("observe-d", "daemonset/fake-gpu-exporter"),
-        ("llm", "deployment/vllm-llama-70b"),
-        ("llm", "deployment/vllm-qwen-7b"),
+        *(("llm", f"deployment/{name}") for name in ENGINE_DEPLOYMENTS),
         ("llm", "deployment/inference-gateway"),
         ("llm", "deployment/loadgen"),
     ):
@@ -293,6 +309,28 @@ def dashboards_up() -> None:
         )
     for path in sorted((ROOT / "grafana/alerts").glob("*.json")):
         configmap(f"alerts-{path.stem}", "monitoring", {path.name: path}, labels={"grafana_alert": "1"})
+
+
+def scenario(
+    engine: str | None = None,
+    gpu: str | None = None,
+    load: str | None = None,
+    routing: str | None = None,
+    pool: str = "decode",
+    model: str = "llama-70b",
+) -> None:
+    if engine:
+        roles = ("prefill", "decode") if pool == "both" else (pool,)
+        for role in roles:
+            kubectl("-n", "llm", "set", "env", f"deployment/vllm-{model}-{role}", f"SCENARIO={engine}")
+    if gpu:
+        kubectl("-n", "observe-d", "set", "env", "daemonset/fake-gpu-exporter", f"SCENARIO={gpu}")
+    if load:
+        shift = PROMPT_SHIFT if load == "prompt_shift" else ""
+        kubectl("-n", "llm", "set", "env", "deployment/loadgen", f"PROMPT_SHIFT={shift}")
+    if routing:
+        weights = SKEWED_WEIGHTS if routing == "scorer_skew" else DEFAULT_WEIGHTS
+        kubectl("-n", "llm", "set", "env", "deployment/inference-gateway", f"SCORER_WEIGHTS={weights}")
 
 
 def status() -> None:
@@ -318,8 +356,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status")
     sub.add_parser("dashboards")
     sc = sub.add_parser("scenario")
-    sc.add_argument("--engine", choices=["normal", "slow", "errors", "kv_pressure", "nccl_error"])
+    sc.add_argument("--engine", choices=ENGINE_SCENARIOS)
+    sc.add_argument("--pool", choices=["decode", "prefill", "both"], default="decode", help="engine pool (P/D)")
+    sc.add_argument("--model", choices=ENGINE_MODELS, default="llama-70b", help="engine model")
     sc.add_argument("--gpu", choices=["load", "throttle", "xid", "ecc", "link_errors"])
+    sc.add_argument("--load", choices=["normal", "prompt_shift"], help="loadgen traffic shape")
+    sc.add_argument("--routing", choices=["normal", "scorer_skew"], help="EPP scorer weights")
+    sc.add_argument("--playbook", choices=sorted(PLAYBOOKS), help="apply the scenario(s) behind a playbook")
     rate = sub.add_parser("rate")
     rate.add_argument("rps", type=float)
     down = sub.add_parser("down")
@@ -342,10 +385,9 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "dashboards":
         dashboards_up()
     elif a.cmd == "scenario":
-        if a.engine:
-            kubectl("-n", "llm", "set", "env", "deployment/vllm-llama-70b", f"SCENARIO={a.engine}")
-        if a.gpu:
-            kubectl("-n", "observe-d", "set", "env", "daemonset/fake-gpu-exporter", f"SCENARIO={a.gpu}")
+        flags = {"engine": a.engine, "gpu": a.gpu, "load": a.load, "routing": a.routing}
+        flags.update(PLAYBOOKS.get(a.playbook, {}) if a.playbook else {})
+        scenario(**flags, pool=a.pool, model=a.model)
     elif a.cmd == "rate":
         kubectl("-n", "llm", "set", "env", "deployment/loadgen", f"RATE={a.rps}")
     elif a.cmd == "down":

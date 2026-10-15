@@ -105,6 +105,9 @@ receivers:
               target_label: pod
             - source_labels: [__meta_kubernetes_namespace]
               target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_role]
+              regex: "(.+)"
+              target_label: role
 
 processors:
   memory_limiter:
@@ -119,6 +122,8 @@ processors:
       - sources: [{from: connection}]
     extract:
       metadata: [k8s.pod.name, k8s.pod.uid, k8s.namespace.name, k8s.node.name, k8s.deployment.name]
+      labels:   # llm-d P/D role of the engine pod (prefill | decode); absent on aggregated pods
+        - {tag_name: llm_d.role, key: llm-d.ai/role, from: pod}
   resource/cluster:
     attributes:
       - {key: k8s.cluster.name, value: "${env:CLUSTER_NAME}", action: upsert}
